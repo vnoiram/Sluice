@@ -29,6 +29,15 @@ if(MSVC)
 endif()
 add_test(NAME engine_graph COMMAND test_engine_graph)
 
+# DSP モジュール(biquad/EQ/gate/compressor/limiter)の単体回帰テスト
+# (実装ガイド §5.5)。ASIO SDK にも Windows API にも依存しない。
+add_executable(test_dsp_modules test_dsp_modules.cpp)
+target_include_directories(test_dsp_modules PRIVATE ${CMAKE_SOURCE_DIR})
+if(MSVC)
+    target_compile_options(test_dsp_modules PRIVATE /W4 /permissive-)
+endif()
+add_test(NAME dsp_modules COMMAND test_dsp_modules)
+
 # WasapiDevice / ProcessLoopbackDevice はコア回帰テストとは別に、
 # コンパイル/リンクできることだけを検証する(ASIO SDK 非依存、実 WASAPI
 # 呼び出しは行わない)。

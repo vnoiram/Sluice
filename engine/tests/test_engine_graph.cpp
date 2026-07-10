@@ -60,6 +60,7 @@ void CheckClose(double actual, double expected, double tol, const std::string& l
 }
 
 constexpr int kBlockFrames = 256;
+constexpr double kSampleRate = 48000.0;
 constexpr size_t kRingCap = 8192;  // 2 の冪。kBlockFrames*16 程度以上
 
 // リングを一定値の信号で埋めるヘルパ(テスト用の疑似デバイス)。
@@ -103,18 +104,25 @@ void TestMixMath() {
     p2.routingGain[2] = 0.0f;
 
     std::vector<StripRuntime> strips;
-    strips.emplace_back(*ring0, kBlockFrames, p0, /*boundaryIndex=*/0);
-    strips.emplace_back(*ring1, kBlockFrames, p1, /*boundaryIndex=*/1);
-    strips.emplace_back(*ring2, kBlockFrames, p2, /*boundaryIndex=*/2);
+    strips.emplace_back(*ring0, kBlockFrames, kSampleRate, p0, /*boundaryIndex=*/0);
+    strips.emplace_back(*ring1, kBlockFrames, kSampleRate, p1, /*boundaryIndex=*/1);
+    strips.emplace_back(*ring2, kBlockFrames, kSampleRate, p2, /*boundaryIndex=*/2);
 
     auto out0 = std::make_unique<SpscRing<float>>(kRingCap);
     auto out1 = std::make_unique<SpscRing<float>>(kRingCap);
     auto out2 = std::make_unique<SpscRing<float>>(kRingCap);
 
+    // リミッタは既定で有効(実装ガイド §5.5)だが、このテストはミックス/
+    // ルーティング算術の検算が目的で、bus2 の期待値(70.0)はリミッタの
+    // 出力上限を大きく超えるため、ここでは無効化して切り分ける
+    // (リミッタ自体の検証は別途行うのが筋)。
     BusParams b0;  // 0dB
+    b0.limiter.enabled = false;
     BusParams b1;  // 0dB
+    b1.limiter.enabled = false;
     BusParams b2;
     b2.gainDb = 20.0f;  // 10 倍
+    b2.limiter.enabled = false;
 
     std::vector<BusRuntime> buses;
     buses.emplace_back(kBlockFrames, std::vector<SpscRing<float>*>{out0.get()}, b0);
@@ -191,7 +199,7 @@ void TestRcuStress() {
         p.routingGain[0] = 0.0f;
         p.gainDb = gainDb;
         std::vector<StripRuntime> strips;
-        strips.emplace_back(*ring, kBlockFrames, p, /*boundaryIndex=*/0);
+        strips.emplace_back(*ring, kBlockFrames, kSampleRate, p, /*boundaryIndex=*/0);
         std::vector<BusRuntime> buses;
         buses.emplace_back(kBlockFrames, std::vector<SpscRing<float>*>{out.get()}, BusParams{});
         return std::make_unique<EngineGraph>(std::move(boundaries), std::move(strips),
