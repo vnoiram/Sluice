@@ -38,6 +38,35 @@ if(MSVC)
 endif()
 add_test(NAME dsp_modules COMMAND test_dsp_modules)
 
+# IPC 用の最小 JSON 実装(engine/ipc/json_value.h)の回帰テスト
+# (実装ガイド §5.7)。ASIO SDK にも Windows API にも依存しない。
+add_executable(test_json_value test_json_value.cpp)
+target_include_directories(test_json_value PRIVATE ${CMAKE_SOURCE_DIR})
+if(MSVC)
+    target_compile_options(test_json_value PRIVATE /W4 /permissive-)
+endif()
+add_test(NAME json_value COMMAND test_json_value)
+
+# 名前付きパイプ IPC サーバ(engine/ipc/pipe_server.h)の実結合テスト
+# (実装ガイド §5.7)。名前付きパイプはオーディオデバイス/サービス不要の
+# 基本 OS 機能なので、WasapiDevice 系と違いここは実際に ctest で実行する。
+if(WIN32)
+    add_executable(test_ipc_pipe test_ipc_pipe.cpp)
+    target_include_directories(test_ipc_pipe PRIVATE ${CMAKE_SOURCE_DIR})
+    target_link_libraries(test_ipc_pipe PRIVATE Threads::Threads)
+    target_compile_definitions(test_ipc_pipe PRIVATE
+        NOMINMAX WIN32_LEAN_AND_MEAN UNICODE _UNICODE
+    )
+    if(MSVC)
+        target_compile_options(test_ipc_pipe PRIVATE /W4 /permissive-)
+    endif()
+    add_test(NAME ipc_pipe COMMAND test_ipc_pipe)
+    # PipeServer::Stop() の既知の制限(クライアントが ReadFile でブロック
+    # したまま切断しないと返らない)を踏んだ場合に CI がハングし続けない
+    # よう、タイムアウトで確実に終わらせる。
+    set_tests_properties(ipc_pipe PROPERTIES TIMEOUT 30)
+endif()
+
 # WasapiDevice / ProcessLoopbackDevice はコア回帰テストとは別に、
 # コンパイル/リンクできることだけを検証する(ASIO SDK 非依存、実 WASAPI
 # 呼び出しは行わない)。
