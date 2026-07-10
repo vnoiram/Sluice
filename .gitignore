@@ -10,4 +10,7 @@ out/
 
 # ASIO SDK 等、ライセンス上リポジトリにコミットしてはならない外部 SDK
 /engine/thirdparty/
+# 誤ってリポジトリルート直下に展開した場合の保険
+/ASIOSDK/
+/ASIO-SDK*/
 *.zip
