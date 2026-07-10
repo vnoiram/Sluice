@@ -1,0 +1,14 @@
+# escape=`
+# ui/(WPF アプリ + IPC クライアント)のビルド/テスト用ツールチェーンイメージ。
+#
+# WPF アプリ自体はこのコンテナ(Windows Server Core, デスクトップ環境無し)
+# では実行できない(dotnet build によるコンパイル確認まで)。
+# SluiceUi.Core / SluiceUi.Core.Tests は WPF に依存しないプレーンな
+# クラスライブラリ/コンソールアプリなので、名前付きパイプを使う
+# EngineClient のテストはここで実際に実行できる
+# (streamdock-sonar の Dockerfile.release.windows と同じ流儀)。
+FROM mcr.microsoft.com/dotnet/sdk:8.0-windowsservercore-ltsc2022
+
+SHELL ["powershell", "-NoLogo", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command"]
+
+WORKDIR C:\work
