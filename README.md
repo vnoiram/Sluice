@@ -87,6 +87,12 @@ Docker Desktop(Windows コンテナモード)を使う:
 アプリ自体の実行・見た目の確認は、Windows デスクトップ環境がある実機で
 行う必要がある(コンテナにはデスクトップが無い)。
 
+### パッケージング(インストーラ)
+
+`packaging/sluice.iss`(Inno Setup)。ビルド手順・署名(SignPath
+Foundation)に関する未実施のアクションアイテムは
+[`packaging/README.md`](packaging/README.md) を参照。
+
 ## ライセンス・商標に関する注意
 
 - **ASIO SDK** は Steinberg のライセンスに同意して各自取得すること。SDK
@@ -94,5 +100,11 @@ Docker Desktop(Windows コンテナモード)を使う:
 - "ASIO is a trademark and software of Steinberg Media Technologies GmbH"。
 - **VB-CABLE** は同梱・自動ダウンロードしない。ユーザーに公式サイトからの
   インストールを案内するのみ(実装ガイド §5.6)。
+- **SmartScreen について**: `sluice-engine.exe`/`SluiceUi.exe`/インストーラ
+  は現時点で未署名(SignPath Foundation への署名申請は公開リポジトリ・CI
+  整備が前提のため未着手。`packaging/README.md` 参照)。初回起動時に
+  Windows SmartScreen が「発行元不明」の警告を出すことがある。その場合は
+  「詳細情報」→「実行」を選ぶことで起動できる(自己責任での実行になる点、
+  配布時にユーザーへ明示すること)。
 - 詳細な設計判断・フェーズ計画はローカルの `docs/` 配下に置いているが、
   個人の作業メモを含むためリポジトリには含めていない(`.gitignore` 対象)。

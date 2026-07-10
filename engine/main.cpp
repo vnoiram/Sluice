@@ -25,9 +25,11 @@
 #include <string>
 #include <vector>
 
+#include "crash/crash_handler.h"
 #include "device/asio_host.h"
 #include "dsp/drift.h"
 #include "rt/spsc_ring.h"
+#include "version.h"
 
 using namespace asiohost;
 
@@ -59,6 +61,11 @@ void PrintDrivers(const std::vector<DriverInfo>& list) {
 } // namespace
 
 int wmain(int argc, wchar_t** argv) {
+    // 起動直後、他の何より先にクラッシュダンプ収集を有効化する
+    // (実装ガイド §5.8)。
+    crashhandler::Install();
+    wprintf(L"sluice-engine %s\n", version::kStringW);
+
     // --- 引数処理 ---------------------------------------------------------
     int inIdx = -1, outIdx = -1;
     bool listOnly = false;

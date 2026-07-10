@@ -94,3 +94,31 @@ if(WIN32)
     # 意図的に add_test() しない(上記コメント参照)。ビルドの成否だけで
     # コンパイル/リンク確認としては十分。
 endif()
+
+# クラッシュダンプ収集(engine/crash/crash_handler.h)の実結合テスト
+# (実装ガイド §5.8)。子プロセスを意図的にクラッシュさせ、.dmp が実際に
+# 書き出されることを確認する。オーディオデバイス/サービス不要なので
+# Windows コンテナでも実行できる。
+if(WIN32)
+    add_executable(crash_handler_test_helper
+        crash_handler_test_helper.cpp
+        ${CMAKE_SOURCE_DIR}/crash/crash_handler.cpp
+    )
+    target_include_directories(crash_handler_test_helper PRIVATE ${CMAKE_SOURCE_DIR})
+    target_link_libraries(crash_handler_test_helper PRIVATE dbghelp)
+    target_compile_definitions(crash_handler_test_helper PRIVATE
+        NOMINMAX WIN32_LEAN_AND_MEAN UNICODE _UNICODE
+    )
+
+    add_executable(test_crash_handler test_crash_handler.cpp)
+    target_include_directories(test_crash_handler PRIVATE ${CMAKE_SOURCE_DIR})
+    target_compile_definitions(test_crash_handler PRIVATE
+        NOMINMAX WIN32_LEAN_AND_MEAN UNICODE _UNICODE
+    )
+    if(MSVC)
+        target_compile_options(test_crash_handler PRIVATE /W4 /permissive-)
+    endif()
+    add_dependencies(test_crash_handler crash_handler_test_helper)
+    add_test(NAME crash_handler COMMAND test_crash_handler)
+    set_tests_properties(crash_handler PROPERTIES TIMEOUT 30)
+endif()

@@ -31,6 +31,8 @@ if(BUILD_ASIO_HOST)
         device/asio_host.cpp
         device/wasapi_device.cpp
         device/process_loopback_device.cpp
+        crash/crash_handler.cpp
+        sluice-engine.rc
     )
 
     target_include_directories(sluice-engine PRIVATE
@@ -40,7 +42,7 @@ if(BUILD_ASIO_HOST)
 
     target_link_libraries(sluice-engine PRIVATE
         SampleRate::samplerate
-        ole32 user32 advapi32 winmm avrt mmdevapi
+        ole32 user32 advapi32 winmm avrt mmdevapi dbghelp
     )
 
     target_compile_definitions(sluice-engine PRIVATE
