@@ -1,0 +1,50 @@
+# escape=`
+# engine/(複数 ASIO パススルー + ドリフト補正)のビルド/テスト用ツールチェーンイメージ。
+#
+# ソースはこのイメージに焼き込まない。実行時に `docker run -v <host>:C:\work`
+# でマウントする(streamdock-plugins の Dockerfile.*.windows と同じ流儀)。
+# ASIO SDK は Steinberg のライセンス上イメージに同梱できないため、
+# sluice-engine.exe(実 ASIO パススルー)はここではビルドしない。
+# engine/tests/(spsc_ring / drift の回帰テスト)は ASIO SDK なしでビルド・実行できる。
+FROM mcr.microsoft.com/windows/servercore:ltsc2022
+
+SHELL ["powershell", "-NoLogo", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command"]
+
+ARG VS_BUILDTOOLS_URL=https://aka.ms/vs/17/release/vs_BuildTools.exe
+ARG CMAKE_ZIP_URL=https://github.com/Kitware/CMake/releases/download/v3.29.3/cmake-3.29.3-windows-x86_64.zip
+ARG VCPKG_ZIP_URL=https://github.com/microsoft/vcpkg/archive/refs/heads/master.zip
+
+RUN Invoke-WebRequest -Uri $env:VS_BUILDTOOLS_URL -OutFile C:\vs_BuildTools.exe; `
+    Start-Process -FilePath C:\vs_BuildTools.exe -Wait -ArgumentList @('--quiet','--wait','--norestart','--nocache','--installPath','C:\BuildTools','--add','Microsoft.VisualStudio.Workload.VCTools','--add','Microsoft.VisualStudio.Component.VC.Tools.x86.x64','--add','Microsoft.VisualStudio.Component.Windows10SDK.19041'); `
+    if (($LASTEXITCODE -ne 0) -and ($LASTEXITCODE -ne 3010)) { exit $LASTEXITCODE }; `
+    Remove-Item C:\vs_BuildTools.exe -Force
+
+RUN Invoke-WebRequest -Uri $env:CMAKE_ZIP_URL -OutFile C:\cmake.zip; `
+    Expand-Archive -Path C:\cmake.zip -DestinationPath C:\ -Force; `
+    Get-ChildItem 'C:\' -Filter 'cmake-*-windows-x86_64' -Directory | `
+        Rename-Item -NewName 'cmake'; `
+    Remove-Item C:\cmake.zip -Force
+
+RUN Invoke-WebRequest -Uri $env:VCPKG_ZIP_URL -OutFile C:\vcpkg.zip; `
+    Expand-Archive -Path C:\vcpkg.zip -DestinationPath C:\ -Force; `
+    Rename-Item -Path 'C:\vcpkg-master' -NewName 'vcpkg'; `
+    Remove-Item C:\vcpkg.zip -Force; `
+    & C:\vcpkg\bootstrap-vcpkg.bat -disableMetrics; `
+    if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+ENV VCPKG_ROOT="C:\vcpkg"
+# 注意: Windows のベースイメージには Docker レベルの ENV PATH が存在しない
+# (`docker inspect` で Config.Env が null)。よって "${PATH}" は展開元が無く
+# 空文字列になり、素朴に "...;${PATH}" と書くと PATH 全体を上書き消失させ、
+# 以降の RUN ステップで裸の `powershell` 等が解決できなくなる
+# (hcs::System::CreateProcess: The system cannot find the file specified)。
+# 必要なシステムパスを明示的に列挙する。
+ENV PATH="C:\cmake\bin;C:\vcpkg;C:\Windows\System32\WindowsPowerShell\v1.0;C:\Windows\System32;C:\Windows"
+
+# libsamplerate を静的リンク triplet で先にビルドし、イメージ層にキャッシュする
+# (テスト対象の engine/dsp/drift.h が使う唯一の外部依存)。vcpkg のポート名は
+# "libsamplerate"(CMake の find_package(SampleRate) とは別名なので注意)。
+RUN & C:\vcpkg\vcpkg.exe install libsamplerate:x64-windows-static-md; `
+    if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+WORKDIR C:\work

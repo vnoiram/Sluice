@@ -1,0 +1,13 @@
+# ローカル専用の設計資料。社外秘/個人メモを含みうるため commit しない。
+/docs/
+
+# Claude Code のセッション/権限設定(ローカル環境依存)
+/.claude/
+
+# CMake ビルド成果物
+build/
+out/
+
+# ASIO SDK 等、ライセンス上リポジトリにコミットしてはならない外部 SDK
+/engine/thirdparty/
+*.zip
