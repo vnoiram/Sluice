@@ -1,6 +1,7 @@
-// asio_host.cpp : ASIO ドライバのロード実装
-#include "asio_host.h"
+// asio_host.cpp : ASIO ドライバのロード実装(IAudioDevice 実装)
+#include "device/asio_host.h"
 
+#include <algorithm>
 #include <cassert>
 
 namespace asiohost {
@@ -107,57 +108,70 @@ void AsioDevice::ReleaseSlot(int slot) {
 }
 
 // ===========================================================================
-// Open / Start / Stop / Close
+// 構築 / Open / Start / Stop / Close
 // ===========================================================================
-bool AsioDevice::Open(const DriverInfo& info, double sampleRate,
-                      bool useInput, std::wstring* errorOut) {
+AsioDevice::AsioDevice(DriverInfo info, bool isInput)
+    : info_(std::move(info)), isInput_(isInput) {}
+
+namespace {
+// リング容量: デバイスバッファサイズの 16 倍を 2 の冪へ切り上げ
+// (実装ガイド §4.2 の目安。プレーナなのでチャンネルごとに同じ容量でよい)。
+size_t RingCapacityFor(long bufferSize) {
+    size_t frames = (size_t)bufferSize * 16;
+    size_t cap = 1;
+    while (cap < frames) cap <<= 1;
+    return cap;
+}
+}  // namespace
+
+bool AsioDevice::Open(const DeviceStreamConfig& config, std::wstring* errorOut) {
     auto fail = [&](const wchar_t* msg) {
         if (errorOut) *errorOut = msg;
         Close();
         return false;
     };
 
-    isInput_ = useInput;
+    channels_ = config.channels;
+    sampleRate_ = config.sampleRate;
     if (!AcquireSlot(this, &slot_)) return fail(L"no free callback slot");
 
     // ASIO の流儀: rclsid と riid の両方にドライバ CLSID を渡す
-    HRESULT hr = CoCreateInstance(info.clsid, nullptr, CLSCTX_INPROC_SERVER,
-                                  info.clsid,
+    HRESULT hr = CoCreateInstance(info_.clsid, nullptr, CLSCTX_INPROC_SERVER,
+                                  info_.clsid,
                                   reinterpret_cast<void**>(&asio_));
     if (FAILED(hr) || !asio_) return fail(L"CoCreateInstance failed");
 
     if (asio_->init(GetDesktopWindow()) != ASIOTrue) {
-        char em[128] = {};
-        asio_->getErrorMessage(em);
-        // (em は ANSI。ログには変換して出す)
         return fail(L"driver init() failed");
     }
 
     long nIn = 0, nOut = 0;
     if (asio_->getChannels(&nIn, &nOut) != ASE_OK)
         return fail(L"getChannels failed");
-    if (useInput ? nIn < 2 : nOut < 2)
-        return fail(L"device does not have 2 channels for this direction");
+    const long available = isInput_ ? nIn : nOut;
+    if (available < channels_)
+        return fail(L"device does not have enough channels for this direction");
 
-    if (asio_->canSampleRate(sampleRate) != ASE_OK ||
-        asio_->setSampleRate(sampleRate) != ASE_OK)
+    if (asio_->canSampleRate(sampleRate_) != ASE_OK ||
+        asio_->setSampleRate(sampleRate_) != ASE_OK)
         return fail(L"sample rate not supported");
 
     long mn, mx, granularity;
     if (asio_->getBufferSize(&mn, &mx, &bufferSize_, &granularity) != ASE_OK)
         return fail(L"getBufferSize failed");
 
-    // 先頭 2ch を確保
-    for (int c = 0; c < 2; ++c) {
-        bufInfo_[c].isInput = useInput ? ASIOTrue : ASIOFalse;
+    bufInfo_.assign(channels_, ASIOBufferInfo{});
+    for (int c = 0; c < channels_; ++c) {
+        bufInfo_[c].isInput = isInput_ ? ASIOTrue : ASIOFalse;
         bufInfo_[c].channelNum = c;
         bufInfo_[c].buffers[0] = bufInfo_[c].buffers[1] = nullptr;
     }
-    if (asio_->createBuffers(bufInfo_, 2, bufferSize_,
+    if (asio_->createBuffers(bufInfo_.data(), channels_, bufferSize_,
                              &g_callbackTable[slot_]) != ASE_OK)
         return fail(L"createBuffers failed");
 
-    for (int c = 0; c < 2; ++c) {
+    chType_.assign(channels_, 0);
+    for (int c = 0; c < channels_; ++c) {
         ASIOChannelInfo ci{};
         ci.channel = c;
         ci.isInput = bufInfo_[c].isInput;
@@ -168,6 +182,21 @@ bool AsioDevice::Open(const DriverInfo& info, double sampleRate,
             return fail(L"unsupported sample type (PoC supports "
                         L"Int32LSB/Float32LSB only)");
     }
+
+    long inLatency = 0, outLatency = 0;
+    if (asio_->getLatencies(&inLatency, &outLatency) == ASE_OK) {
+        const long lat = isInput_ ? inLatency : outLatency;
+        latencySeconds_ = (double)lat / sampleRate_;
+    }
+
+    // RT 開始前にリング/スクラッチを全て確保しておく(RT 中は伸びない)
+    rings_.clear();
+    rings_.reserve(channels_);
+    const size_t cap = RingCapacityFor(bufferSize_);
+    for (int c = 0; c < channels_; ++c)
+        rings_.push_back(std::make_unique<SpscRing<float>>(cap));
+    scratch_.assign((size_t)bufferSize_, 0.0f);
+
     return true;
 }
 
@@ -183,6 +212,34 @@ void AsioDevice::Close() {
     }
     ReleaseSlot(slot_);
     slot_ = -1;
+    bufInfo_.clear();
+    chType_.clear();
+    rings_.clear();
+    scratch_.clear();
+}
+
+// ===========================================================================
+// IAudioDevice 契約
+// ===========================================================================
+SpscRing<float>* AsioDevice::CaptureRing(int ch) {
+    if (!isInput_ || ch < 0 || ch >= (int)rings_.size()) return nullptr;
+    return rings_[(size_t)ch].get();
+}
+
+SpscRing<float>* AsioDevice::RenderRing(int ch) {
+    if (isInput_ || ch < 0 || ch >= (int)rings_.size()) return nullptr;
+    return rings_[(size_t)ch].get();
+}
+
+DeviceStatus AsioDevice::Status() const {
+    DeviceStatus s;
+    s.callbackCount = cbCount_.load(std::memory_order_relaxed);
+    s.underrunCount = underrunCount_.load(std::memory_order_relaxed);
+    s.overrunCount = overrunCount_.load(std::memory_order_relaxed);
+    s.bufferSizeFrames = bufferSize_;
+    s.effectiveLatencySeconds = latencySeconds_;
+    s.resetRequested = resetRequested_.load(std::memory_order_relaxed);
+    return s;
 }
 
 // ===========================================================================
@@ -190,7 +247,30 @@ void AsioDevice::Close() {
 // ===========================================================================
 void AsioDevice::OnBufferSwitch(long index) {
     cbCount_.fetch_add(1, std::memory_order_relaxed);
-    if (process_) process_(index);   // std::function 呼び出し自体は確保しない
+    const size_t n = (size_t)bufferSize_;
+
+    if (isInput_) {
+        // キャプチャ: ASIO バッファ → float 変換 → 各チャンネルの CaptureRing へ
+        for (int c = 0; c < channels_; ++c) {
+            ConvertChannelToFloat(c, index, scratch_.data());
+            if (rings_[(size_t)c]->Write(scratch_.data(), n) < n)
+                overrunCount_.fetch_add(1, std::memory_order_relaxed);
+        }
+        if (blockCallback_) blockCallback_();  // 「新しい入力データが来た」通知
+    } else {
+        // レンダー: まずエンジンにブロック境界を通知し、RenderRing へ
+        // 新しいデータを書き込ませる(実装ガイド §5.4.2 のマスター
+        // コールバックに相当)。そのあとで RenderRing を読み出して出力する。
+        if (blockCallback_) blockCallback_();
+        for (int c = 0; c < channels_; ++c) {
+            size_t got = rings_[(size_t)c]->Read(scratch_.data(), n);
+            if (got < n) {
+                std::fill(scratch_.data() + got, scratch_.data() + n, 0.0f);
+                underrunCount_.fetch_add(1, std::memory_order_relaxed);
+            }
+            ConvertFloatToChannel(c, index, scratch_.data());
+        }
+    }
 }
 
 void AsioDevice::OnSampleRateChanged(double) {
@@ -211,38 +291,34 @@ long AsioDevice::OnAsioMessage(long selector, long /*value*/) {
 }
 
 // ===========================================================================
-// サンプル型変換(2ch 固定, プレーナ ASIO バッファ ⇔ インターリーブ float)
+// サンプル型変換(1ch 分, プレーナ ASIO バッファ ⇔ プレーナ float)
 // ===========================================================================
-void AsioDevice::ConvertInToFloat(long index, float* dst) const {
+void AsioDevice::ConvertChannelToFloat(int c, long index, float* dst) const {
     constexpr float k = 1.0f / 2147483648.0f;
     const long n = bufferSize_;
-    for (int c = 0; c < 2; ++c) {
-        const void* src = bufInfo_[c].buffers[index];
-        if (chType_[c] == ASIOSTInt32LSB) {
-            const int32_t* s = static_cast<const int32_t*>(src);
-            for (long i = 0; i < n; ++i) dst[i * 2 + c] = s[i] * k;
-        } else { // ASIOSTFloat32LSB
-            const float* s = static_cast<const float*>(src);
-            for (long i = 0; i < n; ++i) dst[i * 2 + c] = s[i];
-        }
+    const void* src = bufInfo_[(size_t)c].buffers[index];
+    if (chType_[(size_t)c] == ASIOSTInt32LSB) {
+        const int32_t* s = static_cast<const int32_t*>(src);
+        for (long i = 0; i < n; ++i) dst[i] = s[i] * k;
+    } else { // ASIOSTFloat32LSB
+        const float* s = static_cast<const float*>(src);
+        for (long i = 0; i < n; ++i) dst[i] = s[i];
     }
 }
 
-void AsioDevice::ConvertFloatToOut(long index, const float* src) const {
+void AsioDevice::ConvertFloatToChannel(int c, long index, const float* src) const {
     const long n = bufferSize_;
-    for (int c = 0; c < 2; ++c) {
-        void* dstRaw = bufInfo_[c].buffers[index];
-        if (chType_[c] == ASIOSTInt32LSB) {
-            int32_t* d = static_cast<int32_t*>(dstRaw);
-            for (long i = 0; i < n; ++i) {
-                float v = src[i * 2 + c];
-                v = v > 1.0f ? 1.0f : (v < -1.0f ? -1.0f : v);
-                d[i] = static_cast<int32_t>(v * 2147483647.0f);
-            }
-        } else {
-            float* d = static_cast<float*>(dstRaw);
-            for (long i = 0; i < n; ++i) d[i] = src[i * 2 + c];
+    void* dstRaw = bufInfo_[(size_t)c].buffers[index];
+    if (chType_[(size_t)c] == ASIOSTInt32LSB) {
+        int32_t* d = static_cast<int32_t*>(dstRaw);
+        for (long i = 0; i < n; ++i) {
+            float v = src[i];
+            v = v > 1.0f ? 1.0f : (v < -1.0f ? -1.0f : v);
+            d[i] = static_cast<int32_t>(v * 2147483647.0f);
         }
+    } else {
+        float* d = static_cast<float*>(dstRaw);
+        for (long i = 0; i < n; ++i) d[i] = src[i];
     }
 }
 

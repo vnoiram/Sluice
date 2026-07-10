@@ -67,9 +67,10 @@ fill=50.2%  ratio=1.0000132  xrun(in=0 out=0)  cb(A=93750 B=93748)
 CMakeLists.txt
 main.cpp            エントリポイント。列挙・起動・統計表示
 device/
-  asio_host.h/.cpp  ASIO ドライバのロードと薄いラッパ(要点は .h のコメント参照)
+  iaudio_device.h   デバイス抽象化インターフェース(実装ガイド §5.1)
+  asio_host.h/.cpp  IAudioDevice を実装する ASIO ドライバのラッパ(要点は .h のコメント参照)
 dsp/
-  drift.h           PI コントローラ + libsamplerate ラッパ(ASRC)
+  drift.h           PI コントローラ + libsamplerate ラッパ(ASRC、モノラル)
 rt/
   spsc_ring.h       ロックフリー SPSC リングバッファ
 tests/
@@ -77,7 +78,16 @@ tests/
   test_drift.cpp      FakeDevice によるドリフト補正の回帰テスト(実装ガイド §8)
 scripts/
   run-tests.ps1       Windows Docker コンテナ内で cmake configure/build/ctest を実行
+thirdparty/
+  asiosdk/            ASIO SDK(各自配置。.gitignore 対象、リポジトリには含まれない)
 ```
+
+エンジン内部フォーマットは float32 / プレーナ(チャンネルごとに独立した
+`SpscRing<float>`、実装ガイド §2.3)。`IAudioDevice::CaptureRing(ch)` /
+`RenderRing(ch)` はチャンネルごとに 1 本のリングを返す。ASRC/ドリフト補正は
+デバイス実装の外(エンジン境界 = `main.cpp`)に置き、`AsioDevice` 自身は
+「自分の RT スレッドで自分のリングに読み書きするだけ」に責務を絞っている
+(実装ガイド §5.1)。
 
 ## コア回帰テスト(ASIO SDK 不要)
 
@@ -111,12 +121,16 @@ ctest --test-dir build -C Release --output-on-failure
 Windows ホスト側の PowerShell から実行すると、Docker Desktop(Windows
 コンテナモード)で VS Build Tools + CMake + vcpkg/libsamplerate 環境を
 用意してビルド・テストまで自動で行う(詳細はリポジトリルートの README
-参照)。ASIO SDK は同梱していないため `BUILD_ASIO_HOST=OFF` でコアテスト
-のみを回す。
+参照)。`BUILD_ASIO_HOST` は CMakeLists.txt の既定(ASIO SDK があれば ON、
+なければ自動で OFF にフォールバック)のまま呼んでいるので、
+`engine/thirdparty/asiosdk` を配置していれば `sluice-engine.exe` の実ビルド
+まで、配置していなければコアテストのみを回す。
 
 ## 既知の簡略化(PoC の意図的な割り切り)
 
-- ステレオ固定(各デバイスの先頭 2ch のみ使用)
+- `AsioDevice`/`IAudioDevice` 自体は `DeviceStreamConfig.channels` で任意の
+  チャンネル数を扱えるが、`main.cpp` のパススルーデモは現状ステレオ固定
+  (`kChannels = 2`)
 - サンプル型は Int32LSB / Float32LSB のみ対応(他はエラー表示)
 - kAsioResetRequest は「全体を作り直す」最単純対応
 - ドライバ操作は main スレッド(STA)で実施。製品版ではドライバごとの

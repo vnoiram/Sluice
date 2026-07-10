@@ -9,6 +9,12 @@
 // libsamplerate の src_ratio は「出力レート / 入力レート」であることに注意。
 //   充填率が高い(入力側が速い) → 入力を多めに消費したい
 //   → 出力/入力 比は 1 より小さくする(ratio = 1 / drift)
+//
+// チャンネル数について: エンジン内部フォーマットは float32 / プレーナ
+// (実装ガイド §2.3)。つまり 1 チャンネル = 1 SpscRing<float> であり、
+// AsrcReader もモノラル(1 チャンネル 1 インスタンス)。複数チャンネルを
+// 同期させたい場合は、同じ DriftController が出す srcRatio を全チャンネル
+// 分の AsrcReader に共通で渡す(呼び出し側=エンジン境界の責務)。
 
 #include <algorithm>
 #include <samplerate.h>
@@ -59,19 +65,19 @@ private:
     double alpha_; double y_ = 0.5; bool primed_ = false;
 };
 
-// --- ASRC 付きリング読み出し ----------------------------------------------
-// 消費者(出力デバイス側)から使う。リングにはインターリーブ済み float
-// (frame = channels サンプル)が入っている前提。
+// --- ASRC 付きリング読み出し(モノラル) -------------------------------------
+// 消費者(出力デバイス側)から使う。1 チャンネル分の SpscRing<float> を
+// 直接読む。ステレオ/マルチチャンネルは、チャンネル数だけ AsrcReader を
+// 用意し、同じ srcRatio を渡して呼び出すことで同期させる。
 //
 // RT 安全性メモ: libsamplerate はハンドル生成(src_new)時にのみ確保を行い、
 // src_process 内ではアロケーションしない。ハンドルは必ず起動前に作ること。
 class AsrcReader {
 public:
-    AsrcReader(SpscRing<float>& ring, int channels, int maxOutFrames)
-        : ring_(ring), ch_(channels),
-          stage_((size_t)maxOutFrames * 4 * channels) {
+    AsrcReader(SpscRing<float>& ring, int maxOutFrames)
+        : ring_(ring), stage_((size_t)maxOutFrames * 4) {
         int err = 0;
-        state_ = src_new(SRC_SINC_MEDIUM_QUALITY, channels, &err);
+        state_ = src_new(SRC_SINC_MEDIUM_QUALITY, /*channels=*/1, &err);
         if (!state_) throw std::runtime_error("src_new failed");
     }
     ~AsrcReader() { if (state_) src_delete(state_); }
@@ -87,31 +93,29 @@ public:
             if (stagePos_ >= stageLen_) {
                 const size_t want = stage_.size();
                 const size_t got = ring_.Read(stage_.data(), want);
-                if (got < (size_t)ch_) {           // 実質空
+                if (got == 0) {                     // 実質空
                     underrun = true;
                     // 無音で埋めて即帰る(充填率リセットは呼び出し側で)
-                    std::fill(out + (size_t)produced * ch_,
-                              out + (size_t)outFrames * ch_, 0.0f);
+                    std::fill(out + produced, out + outFrames, 0.0f);
                     return underrun;
                 }
-                stageLen_ = got - (got % ch_);      // フレーム境界に切り詰め
+                stageLen_ = got;
                 stagePos_ = 0;
             }
             SRC_DATA d{};
             d.data_in       = stage_.data() + stagePos_;
-            d.input_frames  = (long)((stageLen_ - stagePos_) / ch_);
-            d.data_out      = out + (size_t)produced * ch_;
+            d.input_frames  = (long)(stageLen_ - stagePos_);
+            d.data_out      = out + produced;
             d.output_frames = outFrames - produced;
             d.src_ratio     = srcRatio;
             d.end_of_input  = 0;
             if (src_process(state_, &d) != 0) { underrun = true; break; }
-            stagePos_ += (size_t)d.input_frames_used * ch_;
+            stagePos_ += (size_t)d.input_frames_used;
             produced  += (int)d.output_frames_gen;
             if (d.input_frames_used == 0 && d.output_frames_gen == 0) break; // 保険
         }
         if (produced < outFrames) {
-            std::fill(out + (size_t)produced * ch_,
-                      out + (size_t)outFrames * ch_, 0.0f);
+            std::fill(out + produced, out + outFrames, 0.0f);
             underrun = true;
         }
         return underrun;
@@ -119,7 +123,6 @@ public:
 
 private:
     SpscRing<float>& ring_;
-    int ch_;
     std::vector<float> stage_;   // 起動前に確保済み。RT 中は伸びない
     size_t stagePos_ = 0, stageLen_ = 0;
     SRC_STATE* state_ = nullptr;

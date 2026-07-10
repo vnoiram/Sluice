@@ -1,14 +1,21 @@
-// main.cpp : ASIO A(入力) → リング → ASRC → ASIO B(出力) パススルー
+// main.cpp : ASIO A(入力) → CaptureRing(チャンネルごと) → ASRC → ASIO B(出力)
+//            RenderRing(チャンネルごと) パススルー
 //
-// データフロー(実装ガイド §4.4):
-//   A.bufferSwitch: 入力2ch → float 変換 → ring.Write
-//   B.bufferSwitch: ring から ASRC 経由で bufferSize フレーム取得 → 出力
-//   B がマスタークロック。ドリフト補正(PI)は B 側で回す。
+// データフロー(実装ガイド §4.4 / §5.1 の IAudioDevice 契約に準拠):
+//   A: OnBufferSwitch が各チャンネルの CaptureRing へ書く(デバイス内部で完結)
+//   B: OnBufferSwitch が RenderRing を読み出す「前」に blockCallback が発火
+//      する(実装ガイド §5.4.2 の「マスターコールバック」に相当)。
+//      この blockCallback の中で、このファイル(エンジン)が A の
+//      CaptureRing から ASRC 経由で 1 ブロック分読み出し、B の
+//      RenderRing へ書き込む。ASRC/ドリフト補正はデバイス側ではなく
+//      ここ(エンジン境界)に置く(実装ガイド §5.1)。
+//   B がマスタークロック。ドリフト補正(PI)は B の blockCallback 内で回す。
 //
 // スレッド構成:
 //   main スレッド  : COM(STA), デバイス管理, 1 秒ごとの統計表示, リセット監視
-//   A の RT スレッド: ドライバ A が作る(bufferSwitch)
-//   B の RT スレッド: ドライバ B が作る(bufferSwitch)
+//   A の RT スレッド: ドライバ A が作る(bufferSwitch)。CaptureRing へ書くのみ。
+//   B の RT スレッド: ドライバ B が作る(bufferSwitch)。blockCallback(エンジン
+//                    の ASRC+ドリフト処理)→ RenderRing 読み出し、の順で走る。
 
 #include <windows.h>
 
@@ -16,6 +23,7 @@
 #include <cstdio>
 #include <memory>
 #include <string>
+#include <vector>
 
 #include "device/asio_host.h"
 #include "dsp/drift.h"
@@ -29,21 +37,18 @@ constexpr double kSampleRate = 48000.0;
 constexpr int    kChannels   = 2;
 
 struct Stats {
-    std::atomic<uint64_t> inOverrun{0};
-    std::atomic<uint64_t> outUnderrun{0};
+    std::atomic<uint64_t> outUnderrun{0};   // ASRC(エンジン境界)でのアンダーラン
 };
 
 struct Pipeline {
-    std::unique_ptr<SpscRing<float>> ring;   // インターリーブ float
-    std::unique_ptr<AsrcReader> asrc;
+    std::vector<std::unique_ptr<AsrcReader>> asrc;   // チャンネルごと
     DriftController drift;
     Ema fillEma{0.99};
     std::atomic<double> ratioForUi{1.0};
     std::atomic<double> fillForUi{0.5};
     std::atomic<bool>   prefilled{false};
     Stats stats;
-    std::vector<float> inScratch;    // A 側 RT 用(起動前確保)
-    std::vector<float> outScratch;   // B 側 RT 用(起動前確保)
+    std::vector<float> scratch;   // B 側エンジン処理用(起動前確保、1ch 分)
 };
 
 void PrintDrivers(const std::vector<DriverInfo>& list) {
@@ -77,7 +82,7 @@ int wmain(int argc, wchar_t** argv) {
     if (listOnly || inIdx < 0 || outIdx < 0) {
         wprintf(L"ASIO drivers:\n");
         PrintDrivers(drivers);
-        wprintf(L"\nUsage: poc --in <index> --out <index>\n");
+        wprintf(L"\nUsage: sluice-engine --in <index> --out <index>\n");
         return 0;
     }
     if (inIdx == outIdx) {
@@ -86,65 +91,68 @@ int wmain(int argc, wchar_t** argv) {
         return 1;
     }
 
+    DeviceStreamConfig cfg;
+    cfg.sampleRate = kSampleRate;
+    cfg.channels = kChannels;
+
     // --- デバイスオープン(リセット時にもここから再実行する)-------------
 retry_open:
-    AsioDevice devIn, devOut;
+    AsioDevice devIn(drivers[(size_t)inIdx], /*isInput=*/true);
+    AsioDevice devOut(drivers[(size_t)outIdx], /*isInput=*/false);
     std::wstring err;
-    if (!devIn.Open(drivers[inIdx], kSampleRate, /*useInput=*/true, &err)) {
+    if (!devIn.Open(cfg, &err)) {
         fwprintf(stderr, L"open input failed: %s\n", err.c_str());
         return 1;
     }
-    if (!devOut.Open(drivers[outIdx], kSampleRate, /*useInput=*/false, &err)) {
+    if (!devOut.Open(cfg, &err)) {
         fwprintf(stderr, L"open output failed: %s\n", err.c_str());
         return 1;
     }
 
-    const long inBuf = devIn.BufferSize();
     const long outBuf = devOut.BufferSize();
-    wprintf(L"in : %s  (buffer %ld)\n", drivers[inIdx].name.c_str(), inBuf);
-    wprintf(L"out: %s  (buffer %ld)\n", drivers[outIdx].name.c_str(), outBuf);
+    wprintf(L"in : %s  (buffer %ld)\n", drivers[(size_t)inIdx].name.c_str(),
+            devIn.BufferSize());
+    wprintf(L"out: %s  (buffer %ld)\n", drivers[(size_t)outIdx].name.c_str(),
+            outBuf);
 
     // --- パイプライン構築(RT 開始前に全メモリ確保)-----------------------
     Pipeline p;
-    // リング容量: 大きい方のバッファ×16 フレーム分を 2 の冪へ切り上げ
-    size_t frames = (size_t)std::max(inBuf, outBuf) * 16;
-    size_t cap = 1; while (cap < frames * kChannels) cap <<= 1;
-    p.ring = std::make_unique<SpscRing<float>>(cap);
-    p.asrc = std::make_unique<AsrcReader>(*p.ring, kChannels, outBuf);
-    p.inScratch.resize((size_t)inBuf * kChannels);
-    p.outScratch.resize((size_t)outBuf * kChannels);
+    p.asrc.reserve(kChannels);
+    for (int c = 0; c < kChannels; ++c)
+        p.asrc.push_back(std::make_unique<AsrcReader>(*devIn.CaptureRing(c), outBuf));
+    p.scratch.resize((size_t)outBuf);
 
-    // --- A(入力)側 RT ---------------------------------------------------
-    devIn.SetProcessCallback([&](long index) {
-        devIn.ConvertInToFloat(index, p.inScratch.data());
-        const size_t n = p.inScratch.size();
-        if (p.ring->Write(p.inScratch.data(), n) < n)
-            p.stats.inOverrun.fetch_add(1, std::memory_order_relaxed);
-    });
-
-    // --- B(出力)側 RT = マスタークロック --------------------------------
-    devOut.SetProcessCallback([&](long index) {
-        // プリフィル: リングが半分たまるまで無音を出す
+    // --- B(出力)側 = マスタークロック。RenderRing 読み出し直前に発火する
+    //     blockCallback の中でエンジン処理(ASRC+ドリフト補正)を行う -------
+    devOut.SetBlockCallback([&]() {
+        // プリフィル: A 側リングが半分たまるまで無音を出す(全チャンネル
+        // 同時に書かれるため、代表してチャンネル 0 の充填率を見ればよい)
         if (!p.prefilled.load(std::memory_order_relaxed)) {
-            if (p.ring->FillRatio() < 0.5) {
-                std::fill(p.outScratch.begin(), p.outScratch.end(), 0.0f);
-                devOut.ConvertFloatToOut(index, p.outScratch.data());
+            if (devIn.CaptureRing(0)->FillRatio() < 0.5) {
+                std::fill(p.scratch.begin(), p.scratch.end(), 0.0f);
+                for (int c = 0; c < kChannels; ++c)
+                    devOut.RenderRing(c)->Write(p.scratch.data(), p.scratch.size());
                 return;
             }
             p.prefilled.store(true, std::memory_order_relaxed);
         }
-        // 充填率 → 平滑化 → PI → リサンプル比
-        const double fill = p.fillEma.Push(p.ring->FillRatio());
+        // 充填率 → 平滑化 → PI → リサンプル比(全チャンネル共通)
+        const double fill = p.fillEma.Push(devIn.CaptureRing(0)->FillRatio());
         const double driftRatio = p.drift.Update(fill);
         const double srcRatio = 1.0 / driftRatio;   // libsamplerate は 出力/入力
         p.fillForUi.store(fill, std::memory_order_relaxed);
         p.ratioForUi.store(driftRatio, std::memory_order_relaxed);
 
-        if (p.asrc->Read(p.outScratch.data(), outBuf, srcRatio)) {
+        bool anyUnderrun = false;
+        for (int c = 0; c < kChannels; ++c) {
+            if (p.asrc[(size_t)c]->Read(p.scratch.data(), outBuf, srcRatio))
+                anyUnderrun = true;
+            devOut.RenderRing(c)->Write(p.scratch.data(), p.scratch.size());
+        }
+        if (anyUnderrun) {
             p.stats.outUnderrun.fetch_add(1, std::memory_order_relaxed);
             p.prefilled.store(false, std::memory_order_relaxed); // 再プリフィル
         }
-        devOut.ConvertFloatToOut(index, p.outScratch.data());
     });
 
     // --- 開始 --------------------------------------------------------------
@@ -155,15 +163,17 @@ retry_open:
     // --- 監視ループ(1 秒ごとに統計、リセット要求を処理)-------------------
     for (;;) {
         Sleep(1000);
+        const DeviceStatus inStatus = devIn.Status();
+        const DeviceStatus outStatus = devOut.Status();
         wprintf(L"fill=%5.1f%%  ratio=%.7f  xrun(in=%llu out=%llu)  "
                 L"cb(A=%llu B=%llu)\n",
                 p.fillForUi.load() * 100.0, p.ratioForUi.load(),
-                (unsigned long long)p.stats.inOverrun.load(),
+                (unsigned long long)inStatus.overrunCount,
                 (unsigned long long)p.stats.outUnderrun.load(),
-                (unsigned long long)devIn.CallbackCount(),
-                (unsigned long long)devOut.CallbackCount());
+                (unsigned long long)inStatus.callbackCount,
+                (unsigned long long)outStatus.callbackCount);
 
-        if (devIn.ResetRequested() || devOut.ResetRequested()) {
+        if (inStatus.resetRequested || outStatus.resetRequested) {
             wprintf(L"** kAsioResetRequest: rebuilding devices **\n");
             devIn.Close();
             devOut.Close();

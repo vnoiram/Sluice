@@ -109,7 +109,10 @@ struct Scenario {
 // 1 シナリオを実行し、収束後の統計を検証する
 // ---------------------------------------------------------------------------
 void RunScenario(const Scenario& sc) {
-    constexpr int kChannels = 2;
+    // エンジン内部フォーマットは float32/プレーナ(実装ガイド §2.3)。
+    // AsrcReader はモノラル(1 チャンネル = 1 リング)なので、ここでは
+    // 1 チャンネル分をシミュレートする(複数チャンネルは同じ srcRatio を
+    // 使い回すだけで、収束特性はチャンネル数に依存しない)。
     constexpr int kBlockFrames = 256;      // ASIO の典型的な preferred buffer
     constexpr double kSimSeconds = 1800.0; // 実時間30分相当を圧縮してシミュレート
     // ±400ppm 級(補正上限 500ppm に近い)の積分項ワインドアップは
@@ -119,18 +122,18 @@ void RunScenario(const Scenario& sc) {
 
     const size_t frames = (size_t)kBlockFrames * 16;
     size_t cap = 1;
-    while (cap < frames * kChannels) cap <<= 1;
+    while (cap < frames) cap <<= 1;
 
     SpscRing<float> ring(cap);
-    AsrcReader asrc(ring, kChannels, kBlockFrames);
+    AsrcReader asrc(ring, kBlockFrames);
     DriftController drift;
     Ema fillEma(0.99);
 
     FakeProducer producer(sc.driftPpm, kBlockFrames, /*jitterHoldbackProb=*/0.1,
                           /*seed=*/(uint32_t)(1000 + sc.driftPpm));
 
-    std::vector<float> inScratch((size_t)kBlockFrames * kChannels, 0.0f);
-    std::vector<float> outScratch((size_t)kBlockFrames * kChannels, 0.0f);
+    std::vector<float> inScratch((size_t)kBlockFrames, 0.0f);
+    std::vector<float> outScratch((size_t)kBlockFrames, 0.0f);
 
     const double dt = (double)kBlockFrames / 48000.0;  // マスター(出力)の1ブロック時間
     const long long totalIters = (long long)(kSimSeconds / dt);
@@ -149,7 +152,7 @@ void RunScenario(const Scenario& sc) {
         {
             RtGuard g;
             producer.Advance(dt, [&](int n) {
-                size_t nFloats = (size_t)n * kChannels;
+                size_t nFloats = (size_t)n;
                 // 起動直後の初期収束(プリフィル/最初の PI 整定)中の
                 // オーバーランは許容する。プリフィル自体が「消費側が
                 // わざと読み出さずに溜める」フェーズなので、ここでの
