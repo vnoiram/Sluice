@@ -18,6 +18,17 @@ if(MSVC)
 endif()
 add_test(NAME drift_convergence COMMAND test_drift)
 
+# エンジングラフ(strip/bus/N×M ルーティング/RCU グラフ差し替え)のオフライン
+# 回帰テスト。ASIO SDK にも Windows API にも依存しない(engine/graph/ と
+# engine/dsp/drift.h のみ使用)。
+add_executable(test_engine_graph test_engine_graph.cpp)
+target_include_directories(test_engine_graph PRIVATE ${CMAKE_SOURCE_DIR})
+target_link_libraries(test_engine_graph PRIVATE SampleRate::samplerate Threads::Threads)
+if(MSVC)
+    target_compile_options(test_engine_graph PRIVATE /W4 /permissive-)
+endif()
+add_test(NAME engine_graph COMMAND test_engine_graph)
+
 # WasapiDevice / ProcessLoopbackDevice はコア回帰テストとは別に、
 # コンパイル/リンクできることだけを検証する(ASIO SDK 非依存、実 WASAPI
 # 呼び出しは行わない)。

@@ -82,6 +82,18 @@ public:
     }
     ~AsrcReader() { if (state_) src_delete(state_); }
     AsrcReader(const AsrcReader&) = delete;
+    AsrcReader& operator=(const AsrcReader&) = delete;
+
+    // ムーブ構築のみ許可する(ring_ が参照メンバのためムーブ代入は不可)。
+    // std::vector<StripRuntime> の emplace_back による再確保(既存要素を
+    // 新しいバッファへ移す)で必要になる。
+    AsrcReader(AsrcReader&& other) noexcept
+        : ring_(other.ring_), stage_(std::move(other.stage_)),
+          stagePos_(other.stagePos_), stageLen_(other.stageLen_),
+          state_(other.state_) {
+        other.state_ = nullptr;
+    }
+    AsrcReader& operator=(AsrcReader&&) = delete;
 
     // outFrames フレームを必ず埋めて返す(足りない分は無音)。RT から呼ぶ。
     // 戻り値: このブロックでアンダーランが発生したか
