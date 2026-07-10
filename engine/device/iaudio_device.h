@@ -16,12 +16,18 @@
 // §2.3)。1 チャンネル = 1 SpscRing<float>。
 //
 // マスタークロックとの同期: SetBlockCallback で登録したコールバックは、
-// このデバイスの RT コールバックが 1 ブロック処理するたびに呼ばれる。
+// このデバイスの RT コールバックが 1 ブロック処理するたびに、その
+// ブロックのフレーム数(frames)を引数に呼ばれる。
 //   - 入力デバイス: CaptureRing へ書き込んだ**あとに**呼ばれる
 //     (「新しい入力データが来た」通知。現状の実装では未使用でも良い)。
 //   - 出力デバイス: RenderRing から読み出す**前に**呼ばれる
 //     (エンジンはここで RenderRing に新しいブロックを書き込む。
 //     実装ガイド §5.4.2 の「マスターコールバック」はこれに相当する)。
+//
+// frames が固定値とは限らない点に注意: ASIO は毎回同じ bufferSizeFrames
+// だが、WASAPI 共有モードはイベントごとに利用可能フレーム数が変動しうる
+// (GetCurrentPadding 依存)。呼び出し側は毎回 frames を見て処理量を
+// 決めること(固定値を決め打ちしない)。
 
 #include <cstdint>
 #include <functional>
@@ -63,5 +69,5 @@ public:
 
     // ブロック境界通知(上記コメント参照)。RT スレッドから呼ばれるため、
     // 登録するコールバック自体も RT セーフ(アロケーションなし等)であること。
-    virtual void SetBlockCallback(std::function<void()> fn) = 0;
+    virtual void SetBlockCallback(std::function<void(int frames)> fn) = 0;
 };

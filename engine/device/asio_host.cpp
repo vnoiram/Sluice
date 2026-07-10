@@ -256,12 +256,12 @@ void AsioDevice::OnBufferSwitch(long index) {
             if (rings_[(size_t)c]->Write(scratch_.data(), n) < n)
                 overrunCount_.fetch_add(1, std::memory_order_relaxed);
         }
-        if (blockCallback_) blockCallback_();  // 「新しい入力データが来た」通知
+        if (blockCallback_) blockCallback_((int)n);  // 「新しい入力データが来た」通知
     } else {
         // レンダー: まずエンジンにブロック境界を通知し、RenderRing へ
         // 新しいデータを書き込ませる(実装ガイド §5.4.2 のマスター
         // コールバックに相当)。そのあとで RenderRing を読み出して出力する。
-        if (blockCallback_) blockCallback_();
+        if (blockCallback_) blockCallback_((int)n);
         for (int c = 0; c < channels_; ++c) {
             size_t got = rings_[(size_t)c]->Read(scratch_.data(), n);
             if (got < n) {

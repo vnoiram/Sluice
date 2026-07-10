@@ -84,7 +84,7 @@ public:
     SpscRing<float>* CaptureRing(int ch) override;
     SpscRing<float>* RenderRing(int ch) override;
     DeviceStatus Status() const override;
-    void SetBlockCallback(std::function<void()> fn) override {
+    void SetBlockCallback(std::function<void(int frames)> fn) override {
         blockCallback_ = std::move(fn);
     }
 
@@ -122,7 +122,7 @@ private:
     std::vector<float> scratch_;            // OnBufferSwitch 内の変換用(起動前確保)
     double latencySeconds_ = 0.0;
 
-    std::function<void()> blockCallback_;
+    std::function<void(int frames)> blockCallback_;
     std::atomic<bool> resetRequested_{false};
     std::atomic<uint64_t> cbCount_{0};
     std::atomic<uint64_t> underrunCount_{0};

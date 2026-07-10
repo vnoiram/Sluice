@@ -29,6 +29,7 @@ if(BUILD_ASIO_HOST)
     add_executable(sluice-engine
         main.cpp
         device/asio_host.cpp
+        device/wasapi_device.cpp
     )
 
     target_include_directories(sluice-engine PRIVATE
@@ -38,7 +39,7 @@ if(BUILD_ASIO_HOST)
 
     target_link_libraries(sluice-engine PRIVATE
         SampleRate::samplerate
-        ole32 user32 advapi32 winmm
+        ole32 user32 advapi32 winmm avrt
     )
 
     target_compile_definitions(sluice-engine PRIVATE

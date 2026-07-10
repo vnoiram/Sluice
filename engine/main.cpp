@@ -124,14 +124,14 @@ retry_open:
 
     // --- B(出力)側 = マスタークロック。RenderRing 読み出し直前に発火する
     //     blockCallback の中でエンジン処理(ASRC+ドリフト補正)を行う -------
-    devOut.SetBlockCallback([&]() {
+    devOut.SetBlockCallback([&](int frames) {
         // プリフィル: A 側リングが半分たまるまで無音を出す(全チャンネル
         // 同時に書かれるため、代表してチャンネル 0 の充填率を見ればよい)
         if (!p.prefilled.load(std::memory_order_relaxed)) {
             if (devIn.CaptureRing(0)->FillRatio() < 0.5) {
-                std::fill(p.scratch.begin(), p.scratch.end(), 0.0f);
+                std::fill(p.scratch.begin(), p.scratch.begin() + frames, 0.0f);
                 for (int c = 0; c < kChannels; ++c)
-                    devOut.RenderRing(c)->Write(p.scratch.data(), p.scratch.size());
+                    devOut.RenderRing(c)->Write(p.scratch.data(), (size_t)frames);
                 return;
             }
             p.prefilled.store(true, std::memory_order_relaxed);
@@ -145,9 +145,9 @@ retry_open:
 
         bool anyUnderrun = false;
         for (int c = 0; c < kChannels; ++c) {
-            if (p.asrc[(size_t)c]->Read(p.scratch.data(), outBuf, srcRatio))
+            if (p.asrc[(size_t)c]->Read(p.scratch.data(), frames, srcRatio))
                 anyUnderrun = true;
-            devOut.RenderRing(c)->Write(p.scratch.data(), p.scratch.size());
+            devOut.RenderRing(c)->Write(p.scratch.data(), (size_t)frames);
         }
         if (anyUnderrun) {
             p.stats.outUnderrun.fetch_add(1, std::memory_order_relaxed);
