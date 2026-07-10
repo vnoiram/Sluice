@@ -18,22 +18,30 @@ if(MSVC)
 endif()
 add_test(NAME drift_convergence COMMAND test_drift)
 
-# WasapiDevice はコア回帰テストとは別に、コンパイル/リンクできることだけを
-# 検証する(ASIO SDK 非依存、実 WASAPI 呼び出しは行わない)。
-# Windows コンテナ等オーディオサービスが無い環境でも安全に実行できるよう、
-# テスト本体はシンボル解決の確認のみで実際のデバイス列挙は呼ばない。
+# WasapiDevice / ProcessLoopbackDevice はコア回帰テストとは別に、
+# コンパイル/リンクできることだけを検証する(ASIO SDK 非依存、実 WASAPI
+# 呼び出しは行わない)。
+#
+# 注意: この実行ファイルは ProcessLoopbackDevice が使う
+# ActivateAudioInterfaceAsync を静的リンクしているため、実行時に
+# Mmdevapi.dll のロードが必要になる。Windows Server Core ベースの
+# ビルドコンテナにはオーディオサブシステムが無く Mmdevapi.dll 自体が
+# 存在しないため、この exe は「ビルド(コンパイル+リンク)できること」の
+# 確認までに留め、ctest では実行しない(実機では問題なく起動する)。
 if(WIN32)
     add_executable(test_wasapi_compile
         test_wasapi_compile.cpp
         ${CMAKE_SOURCE_DIR}/device/wasapi_device.cpp
+        ${CMAKE_SOURCE_DIR}/device/process_loopback_device.cpp
     )
     target_include_directories(test_wasapi_compile PRIVATE ${CMAKE_SOURCE_DIR})
-    target_link_libraries(test_wasapi_compile PRIVATE ole32 avrt)
+    target_link_libraries(test_wasapi_compile PRIVATE ole32 avrt mmdevapi)
     target_compile_definitions(test_wasapi_compile PRIVATE
         NOMINMAX WIN32_LEAN_AND_MEAN UNICODE _UNICODE
     )
     if(MSVC)
         target_compile_options(test_wasapi_compile PRIVATE /W4 /permissive-)
     endif()
-    add_test(NAME wasapi_compile COMMAND test_wasapi_compile)
+    # 意図的に add_test() しない(上記コメント参照)。ビルドの成否だけで
+    # コンパイル/リンク確認としては十分。
 endif()
