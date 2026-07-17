@@ -1,5 +1,7 @@
 # Sluice
 
+English version: [README.en.md](README.en.md)
+
 Windows 向け音声ルーティング/ミキサーアプリ。Voicemeeter 相当の機能に加え、
 「複数 ASIO デバイスの同時利用」「入出力数の無制限」を目指す OSS。
 
