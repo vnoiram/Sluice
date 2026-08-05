@@ -14,3 +14,4 @@ out/
 /ASIOSDK/
 /ASIO-SDK*/
 *.zip
+.pre-push-check-ignore.md
