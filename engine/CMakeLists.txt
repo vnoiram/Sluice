@@ -59,3 +59,12 @@ if(BUILD_TESTS)
     enable_testing()
     add_subdirectory(tests)
 endif()
+
+# tools/latencybench(実装ガイド §7.3)はリポジトリルート直下 /tools に
+# 独立した CMake プロジェクトとして存在する(§2.5 のレイアウトに合わせる)。
+# out-of-tree で取り込むことで、engine/scripts/run-tests.ps1 のようなターゲット
+# 名を決め打ちしない汎用 cmake/ctest ドライバから自動的にビルド対象になる。
+if(EXISTS "${CMAKE_SOURCE_DIR}/../tools/latencybench/CMakeLists.txt")
+    add_subdirectory("${CMAKE_SOURCE_DIR}/../tools/latencybench"
+                     "${CMAKE_BINARY_DIR}/tools/latencybench")
+endif()
