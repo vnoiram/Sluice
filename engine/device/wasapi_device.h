@@ -61,6 +61,12 @@ public:
     ~WasapiDevice() override { Close(); }
     WasapiDevice(const WasapiDevice&) = delete;
 
+    // 実装ガイド §5.2.1 の手順(SetClientProperties→GetMixFormat→
+    // GetSharedModeEnginePeriod→64 の合法性判定)だけを行い、フルの
+    // Initialize/Start はしない。IAudioClient3 非対応デバイスでは
+    // supports64=false・recommendedLane=Compat を返す。
+    DeviceCaps Probe(double sampleRate) override;
+
     bool Open(const DeviceStreamConfig& config, std::wstring* errorOut) override;
     void Start() override;
     void Stop() override;
@@ -84,6 +90,16 @@ private:
     void ThreadMain();       // イベント駆動ループ本体(専用スレッド上で実行)
     void ProcessOneCapture();  // GetBuffer 1回分: デインターリーブして CaptureRing へ
     void ProcessOneRender(UINT32 availableFrames);  // RenderRing から読みインターリーブして GetBuffer へ
+
+    // 実装ガイド §5.2.1 の周期問い合わせ手順を Probe()/Open() で共有する
+    // ためのヘルパ。client は Activate 済み(Initialize 前)の IAudioClient。
+    // rawMode が true なら AUDCLNT_STREAMOPTIONS_RAW を要求する
+    // (実装ガイド §5.2.4)。成功したら true を返し、各 out 引数に
+    // GetSharedModeEnginePeriod の結果を書く。IAudioClient3 非対応なら false。
+    static bool QuerySharedModePeriod(IAudioClient* client, WAVEFORMATEX* mixFormat,
+                                       bool rawMode, UINT32* defaultPeriod,
+                                       UINT32* fundamentalPeriod, UINT32* minPeriod,
+                                       UINT32* maxPeriod);
 
     std::wstring endpointId_;
     bool isCapture_;
@@ -117,6 +133,7 @@ private:
     std::atomic<uint64_t> overrunCount_{0};
     std::atomic<bool> resetRequested_{false};
     double latencySeconds_ = 0.0;
+    Lane lane_ = Lane::Compat;  // Open() 完了時に確定(periodFrames_ から判定)
 
     // IMMNotificationClient 実装(実体は .cpp 内の WasapiDevice::NotificationClient)。
     // 生ポインタで保持し、Close() で Unregister + Release する。

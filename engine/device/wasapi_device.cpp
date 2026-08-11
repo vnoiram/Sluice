@@ -1,6 +1,8 @@
 // wasapi_device.cpp : WASAPI 共有モードキャプチャ/レンダー実装
 #include "device/wasapi_device.h"
 
+#include "device/wasapi_period.h"
+
 #include <avrt.h>
 #include <propsys.h>
 // PKEY_Device_FriendlyName 等は DEFINE_PROPERTYKEY マクロで宣言されており、
@@ -27,7 +29,7 @@ inline float PcmToFloat(const uint8_t* p, int bytesPerSample) {
         return v / 32768.0f;
     }
     case 3: {
-        // Int24 の 3 バイトパック。符号拡張を忘れない(実装ガイド §9)。
+        // Int24 の 3 バイトパック。符号拡張を忘れない(実装ガイド §11)。
         int32_t v = (int32_t)((uint32_t)p[0] | ((uint32_t)p[1] << 8) |
                               ((uint32_t)p[2] << 16));
         if (v & 0x00800000) v |= (int32_t)0xFF000000u;
@@ -197,6 +199,100 @@ private:
 WasapiDevice::WasapiDevice(std::wstring endpointId, bool isCapture)
     : endpointId_(std::move(endpointId)), isCapture_(isCapture) {}
 
+// ===========================================================================
+// 周期問い合わせ(実装ガイド §5.2.1)。Probe()/Open() 共通ヘルパ。
+// ===========================================================================
+bool WasapiDevice::QuerySharedModePeriod(IAudioClient* client, WAVEFORMATEX* mixFormat,
+                                          bool rawMode, UINT32* defaultPeriod,
+                                          UINT32* fundamentalPeriod, UINT32* minPeriod,
+                                          UINT32* maxPeriod) {
+    bool ok = false;
+    IAudioClient3* client3 = nullptr;
+    if (SUCCEEDED(client->QueryInterface(__uuidof(IAudioClient3),
+                                         reinterpret_cast<void**>(&client3)))) {
+        // ① SetClientProperties を GetSharedModeEnginePeriod より先に呼ぶ
+        //    (実装ガイド §5.2.1: 「呼び出し順序が重要。返る周期はこれに依存する」)。
+        //    client3 は IAudioClient2 を継承しているため QI は共用できる。
+        AudioClientProperties props{};
+        props.cbSize = sizeof(props);
+        props.bIsOffload = FALSE;
+        props.eCategory = AudioCategory_Media;
+        props.Options = rawMode ? AUDCLNT_STREAMOPTIONS_RAW : AUDCLNT_STREAMOPTIONS_NONE;
+        client3->SetClientProperties(&props);
+
+        // ② ミックスフォーマットは呼び出し側から渡されたものをそのまま使う
+        //    (GetMixFormat と異なるレートで問い合わせるとエラーになるため、
+        //    呼び出し側が既に取得済みの mixFormat を再利用する)。
+        // ③ 周期の範囲を取得
+        ok = SUCCEEDED(client3->GetSharedModeEnginePeriod(mixFormat, defaultPeriod,
+                                                           fundamentalPeriod, minPeriod,
+                                                           maxPeriod));
+        client3->Release();
+    }
+    return ok;
+}
+
+// ===========================================================================
+// 能力プローブ(実装ガイド §5.2.1)
+// ===========================================================================
+DeviceCaps WasapiDevice::Probe(double sampleRate) {
+    DeviceCaps caps;
+
+    IMMDeviceEnumerator* enumerator = nullptr;
+    if (FAILED(CoCreateInstance(__uuidof(MMDeviceEnumerator), nullptr, CLSCTX_ALL,
+                                __uuidof(IMMDeviceEnumerator),
+                                reinterpret_cast<void**>(&enumerator))))
+        return caps;
+
+    IMMDevice* device = nullptr;
+    HRESULT hr = endpointId_.empty()
+        ? enumerator->GetDefaultAudioEndpoint(isCapture_ ? eCapture : eRender, eConsole, &device)
+        : enumerator->GetDevice(endpointId_.c_str(), &device);
+    if (FAILED(hr) || !device) {
+        enumerator->Release();
+        return caps;
+    }
+
+    IAudioClient* client = nullptr;
+    if (FAILED(device->Activate(__uuidof(IAudioClient), CLSCTX_ALL, nullptr,
+                                reinterpret_cast<void**>(&client)))) {
+        device->Release();
+        enumerator->Release();
+        return caps;
+    }
+
+    WAVEFORMATEX* mixFormat = nullptr;
+    if (SUCCEEDED(client->GetMixFormat(&mixFormat)) && mixFormat) {
+        // sampleRate 引数はプローブ対象レートの参考情報。GetMixFormat は
+        // デバイス既定レートを返すため、決め打ちの置き換えはしない
+        // (実装ガイド §5.2.4「GetMixFormat の結果に従う。決め打ちしない」)。
+        (void)sampleRate;
+
+        UINT32 defaultPeriod = 0, fundamentalPeriod = 0, minPeriod = 0, maxPeriod = 0;
+        if (QuerySharedModePeriod(client, mixFormat, /*rawMode=*/false, &defaultPeriod,
+                                   &fundamentalPeriod, &minPeriod, &maxPeriod)) {
+            caps.minPeriodFrames = minPeriod;
+            caps.fundamentalFrames = fundamentalPeriod;
+            caps.defaultPeriodFrames = defaultPeriod;
+            // 実装ガイド §5.2.1: 「fundamental の整数倍」制約を含めた判定。
+            caps.supports64 = (64 >= minPeriod && 64 <= maxPeriod) &&
+                               (fundamentalPeriod == 0 || 64 % fundamentalPeriod == 0);
+            caps.recommendedLane = caps.supports64 ? Lane::RT : Lane::Compat;
+        } else {
+            // IAudioClient3 非対応。GetBufferSize 相当の情報は Initialize
+            // しないと取れないため、デバイス既定を Compat Lane として報告する。
+            caps.defaultPeriodFrames = 0;
+            caps.recommendedLane = Lane::Compat;
+        }
+        CoTaskMemFree(mixFormat);
+    }
+
+    client->Release();
+    device->Release();
+    enumerator->Release();
+    return caps;
+}
+
 bool WasapiDevice::Open(const DeviceStreamConfig& config, std::wstring* errorOut) {
     auto fail = [&](const wchar_t* msg) {
         if (errorOut) *errorOut = msg;
@@ -252,32 +348,47 @@ bool WasapiDevice::Open(const DeviceStreamConfig& config, std::wstring* errorOut
         return fail(L"unsupported WASAPI mix format (PCM/IEEE_FLOAT only)");
     }
 
-    // 低遅延パス(実装ガイド §5.2): IAudioClient3 が使えれば
-    // InitializeSharedAudioStream で小さい周期を要求する。
-    // 使えない/失敗する場合は通常の共有モード初期化にフォールバックする。
+    // 低遅延パス(実装ガイド §5.2.1〜§5.2.3): config.aggressiveLowLatency が
+    // true のときだけ IAudioClient3 の小バッファ要求パスを試す。既定
+    // (false)ではデバイス既定周期(defaultPeriod)で開く ——
+    // 小バッファ要求は同じエンドポイントを使う他アプリを巻き込むため、
+    // オプトインにする(実装ガイド §5.2.3「誠実さの問題」)。
     bool initialized = false;
     IAudioClient3* client3 = nullptr;
     if (SUCCEEDED(audioClient_->QueryInterface(__uuidof(IAudioClient3),
                                                reinterpret_cast<void**>(&client3)))) {
         UINT32 defaultPeriod = 0, fundamentalPeriod = 0, minPeriod = 0, maxPeriod = 0;
-        if (SUCCEEDED(client3->GetSharedModeEnginePeriod(
-                mixFormat, &defaultPeriod, &fundamentalPeriod, &minPeriod, &maxPeriod))) {
-            UINT32 periodFrames = minPeriod;
-            if (config.preferredBufferFrames > 0 && fundamentalPeriod > 0) {
-                UINT32 want = (UINT32)config.preferredBufferFrames;
-                want = std::clamp(want, minPeriod, maxPeriod);
-                // fundamentalPeriod の倍数に丸める
-                periodFrames = ((want + fundamentalPeriod / 2) / fundamentalPeriod) *
-                                fundamentalPeriod;
-                periodFrames = std::clamp(periodFrames, minPeriod, maxPeriod);
+        if (QuerySharedModePeriod(audioClient_, mixFormat, config.rawMode, &defaultPeriod,
+                                   &fundamentalPeriod, &minPeriod, &maxPeriod)) {
+            UINT32 periodFrames = defaultPeriod;
+            if (config.aggressiveLowLatency && config.preferredBufferFrames > 0) {
+                periodFrames = wasapi::ChoosePeriodFrames(
+                    (UINT32)config.preferredBufferFrames, minPeriod, maxPeriod, fundamentalPeriod);
             }
-            initialized = SUCCEEDED(client3->InitializeSharedAudioStream(
-                AUDCLNT_STREAMFLAGS_EVENTCALLBACK, periodFrames, mixFormat, nullptr));
+
+            HRESULT hrInit = client3->InitializeSharedAudioStream(
+                AUDCLNT_STREAMFLAGS_EVENTCALLBACK, periodFrames, mixFormat, nullptr);
+
+            if (hrInit == AUDCLNT_E_ENGINE_PERIODICITY_LOCKED) {
+                // 実装ガイド §5.2.2: 複数の WASAPI デバイスを同時に開く
+                // 本アプリでは頻繁に起きるため、正常系として扱う。現在の
+                // エンジン周期を問い合わせて合わせる(10ms フォールバックへは
+                // 落とさない)。
+                WAVEFORMATEX* curFmt = nullptr;
+                UINT32 curPeriod = 0;
+                if (SUCCEEDED(client3->GetCurrentSharedModeEnginePeriod(&curFmt, &curPeriod))) {
+                    hrInit = client3->InitializeSharedAudioStream(
+                        AUDCLNT_STREAMFLAGS_EVENTCALLBACK, curPeriod, curFmt, nullptr);
+                    if (curFmt) CoTaskMemFree(curFmt);
+                }
+            }
+            initialized = SUCCEEDED(hrInit);
         }
         client3->Release();
     }
     if (!initialized) {
-        // 10ms 周期を要求(100ns 単位: 1ms = 10,000)
+        // IAudioClient3 非対応、またはロック後の再初期化も失敗した場合の
+        // 最終フォールバック: 10ms 周期を要求(100ns 単位: 1ms = 10,000)。
         constexpr REFERENCE_TIME kBufferDuration = 10 * 10000;
         initialized = SUCCEEDED(audioClient_->Initialize(
             AUDCLNT_SHAREMODE_SHARED, AUDCLNT_STREAMFLAGS_EVENTCALLBACK,
@@ -289,6 +400,9 @@ bool WasapiDevice::Open(const DeviceStreamConfig& config, std::wstring* errorOut
 
     if (FAILED(audioClient_->GetBufferSize(&periodFrames_)))
         return fail(L"GetBufferSize failed");
+
+    // 実装ガイド §2.3「レーン設計」: 64 サンプル達成をもって RT Lane と判定する。
+    lane_ = (periodFrames_ <= 64) ? Lane::RT : Lane::Compat;
 
     audioEvent_ = CreateEventW(nullptr, FALSE, FALSE, nullptr);
     stopEvent_ = CreateEventW(nullptr, FALSE, FALSE, nullptr);
@@ -383,6 +497,7 @@ DeviceStatus WasapiDevice::Status() const {
     s.bufferSizeFrames = (long)periodFrames_;
     s.effectiveLatencySeconds = latencySeconds_;
     s.resetRequested = resetRequested_.load(std::memory_order_relaxed);
+    s.lane = lane_;
     return s;
 }
 
@@ -460,7 +575,7 @@ void WasapiDevice::ProcessOneCapture() {
 
 void WasapiDevice::ProcessOneRender(UINT32 availableFrames) {
     // エンジンにブロック境界を通知し、RenderRing へ新しいデータを
-    // 書き込ませてから(実装ガイド §5.4.2 のマスターコールバック相当)、
+    // 書き込ませてから(実装ガイド §5.4.1 のマスターコールバック相当)、
     // 実際に WASAPI バッファへ書き出す。
     if (blockCallback_) blockCallback_((int)availableFrames);
 
