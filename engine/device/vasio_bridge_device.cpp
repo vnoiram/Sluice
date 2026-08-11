@@ -155,6 +155,18 @@ DeviceStatus VasioBridgeDevice::Status() const {
     return s;
 }
 
+void VasioBridgeDevice::RequestDawReset() {
+    if (!mappedBase_) return;
+    auto* control = reinterpret_cast<vasio::SharedControlBlock*>(mappedBase_);
+    uint32_t expected = static_cast<uint32_t>(vasio::ConnectionState::Connected);
+    // Connected のときだけ ResetPending へ遷移させる(CAS が失敗するのは
+    // Disconnected 中、またはまだ前回の ResetPending を vasio.dll が消化して
+    // いない場合 —— どちらも何もしないのが正しい)。
+    control->connectionState.compare_exchange_strong(
+        expected, static_cast<uint32_t>(vasio::ConnectionState::ResetPending),
+        std::memory_order_acq_rel, std::memory_order_relaxed);
+}
+
 void VasioBridgeDevice::PumpSharedMemory(int frames) {
     if (!mappedBase_ || frames <= 0) return;
     if (static_cast<size_t>(frames) > scratch_.size()) frames = static_cast<int>(scratch_.size());

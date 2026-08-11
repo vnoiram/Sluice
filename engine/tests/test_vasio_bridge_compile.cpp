@@ -8,6 +8,8 @@
 
 int main() {
     vasiobridge::VasioBridgeDevice device;
-    (void)device;
+    // mappedBase_ が null(Open() 未呼び出し)なら no-op で安全に戻ることを
+    // 確認する(gap 11: RequestDawReset のコンパイル/リンク確認)。
+    device.RequestDawReset();
     return 0;
 }

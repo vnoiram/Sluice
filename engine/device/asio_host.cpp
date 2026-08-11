@@ -127,7 +127,7 @@ size_t RingCapacityFor(long bufferSize) {
 // ===========================================================================
 // 能力プローブ(実装ガイド §5.1・§4.1.4)
 // ===========================================================================
-DeviceCaps AsioDevice::Probe(double sampleRate) {
+DeviceCaps AsioDevice::ProbeImpl(double sampleRate) {
     DeviceCaps caps;
     caps.recommendedLane = Lane::RT;  // ASIO は常に RT Lane 候補
 
@@ -144,7 +144,10 @@ DeviceCaps AsioDevice::Probe(double sampleRate) {
                                   info_.clsid, reinterpret_cast<void**>(&probe));
     if (FAILED(hr) || !probe) return caps;
 
-    if (probe->init(GetDesktopWindow()) != ASIOTrue) {
+    // ProbeImpl も StaThread::Invoke 経由(公開の Probe() ラッパ)で必ず
+    // このドライバ専用の StaThread 上で実行される前提なので、init() に渡す
+    // ウィンドウも Open() と揃える(実装ガイド §4.1.5)。
+    if (probe->init(StaThread_().Hwnd()) != ASIOTrue) {
         probe->Release();
         return caps;
     }
@@ -167,10 +170,14 @@ DeviceCaps AsioDevice::Probe(double sampleRate) {
     return caps;
 }
 
-bool AsioDevice::Open(const DeviceStreamConfig& config, std::wstring* errorOut) {
+bool AsioDevice::OpenImpl(const DeviceStreamConfig& config, std::wstring* errorOut) {
     auto fail = [&](const wchar_t* msg) {
         if (errorOut) *errorOut = msg;
-        Close();
+        // 注意: 公開の Close()(StaThread::Invoke 経由)ではなく CloseImpl()
+        // を直接呼ぶこと。OpenImpl 自体が既に staThread_ 上で実行中の
+        // タスクなので、ここで Close() を呼ぶと Invoke が自分自身の完了を
+        // 待つ形になりデッドロックする(sta_thread.h の注意書き参照)。
+        CloseImpl();
         return false;
     };
 
@@ -184,7 +191,9 @@ bool AsioDevice::Open(const DeviceStreamConfig& config, std::wstring* errorOut) 
                                   reinterpret_cast<void**>(&asio_));
     if (FAILED(hr) || !asio_) return fail(L"CoCreateInstance failed");
 
-    if (asio_->init(GetDesktopWindow()) != ASIOTrue) {
+    // 実装ガイド §4.1.5: このドライバ専用の StaThread が持つウィンドウを渡す
+    // (罠3: 専用の隠しウィンドウが要るドライバもある、asio_host.h 参照)。
+    if (asio_->init(StaThread_().Hwnd()) != ASIOTrue) {
         return fail(L"driver init() failed");
     }
 
@@ -199,9 +208,20 @@ bool AsioDevice::Open(const DeviceStreamConfig& config, std::wstring* errorOut) 
         asio_->setSampleRate(sampleRate_) != ASE_OK)
         return fail(L"sample rate not supported");
 
-    long mn, mx, granularity;
-    if (asio_->getBufferSize(&mn, &mx, &bufferSize_, &granularity) != ASE_OK)
+    long mn, mx, preferred, granularity;
+    if (asio_->getBufferSize(&mn, &mx, &preferred, &granularity) != ASE_OK)
         return fail(L"getBufferSize failed");
+
+    // 実装ガイド §4.1.4: preferred が 64 でなくても明示的に 64 を要求する。
+    constexpr long kDesiredBufferSize = 64;
+    bufferSize_ = std::clamp(kDesiredBufferSize, mn, mx);
+    if (granularity > 0) {
+        // mn + k*granularity の刻みに丸める(切り上げ、mx を超えない)。
+        const long steps = (bufferSize_ - mn + granularity - 1) / granularity;
+        bufferSize_ = std::min(mx, mn + steps * granularity);
+    }
+    // granularity <= 0 (多くのドライバは -1)は「2 の冪のみ許容」の慣行で、
+    // 64 はそのまま使える。
 
     bufInfo_.assign(channels_, ASIOBufferInfo{});
     for (int c = 0; c < channels_; ++c) {
@@ -221,9 +241,10 @@ bool AsioDevice::Open(const DeviceStreamConfig& config, std::wstring* errorOut) 
         if (asio_->getChannelInfo(&ci) != ASE_OK)
             return fail(L"getChannelInfo failed");
         chType_[c] = ci.type;
-        if (ci.type != ASIOSTInt32LSB && ci.type != ASIOSTFloat32LSB)
-            return fail(L"unsupported sample type (PoC supports "
-                        L"Int32LSB/Float32LSB only)");
+        if (ci.type != ASIOSTInt32LSB && ci.type != ASIOSTFloat32LSB &&
+            ci.type != ASIOSTInt24LSB && ci.type != ASIOSTInt16LSB)
+            return fail(L"unsupported sample type (supports "
+                        L"Int32LSB/Float32LSB/Int24LSB/Int16LSB only)");
     }
 
     long inLatency = 0, outLatency = 0;
@@ -243,10 +264,10 @@ bool AsioDevice::Open(const DeviceStreamConfig& config, std::wstring* errorOut) 
     return true;
 }
 
-void AsioDevice::Start() { if (asio_) asio_->start(); }
-void AsioDevice::Stop()  { if (asio_) asio_->stop(); }
+void AsioDevice::StartImpl() { if (asio_) asio_->start(); }
+void AsioDevice::StopImpl()  { if (asio_) asio_->stop(); }
 
-void AsioDevice::Close() {
+void AsioDevice::CloseImpl() {
     if (asio_) {
         asio_->stop();
         asio_->disposeBuffers();
@@ -344,6 +365,19 @@ void AsioDevice::ConvertChannelToFloat(int c, long index, float* dst) const {
     if (chType_[(size_t)c] == ASIOSTInt32LSB) {
         const int32_t* s = static_cast<const int32_t*>(src);
         for (long i = 0; i < n; ++i) dst[i] = s[i] * k;
+    } else if (chType_[(size_t)c] == ASIOSTInt24LSB) {
+        // 3 バイト詰め・リトルエンディアン(パディング無し)。
+        const uint8_t* s = static_cast<const uint8_t*>(src);
+        for (long i = 0; i < n; ++i) {
+            const uint8_t* b = s + i * 3;
+            int32_t v = (int32_t)((uint32_t)b[0] | ((uint32_t)b[1] << 8) |
+                                  ((uint32_t)b[2] << 16));
+            if (v & 0x00800000) v |= (int32_t)0xFF000000;  // 符号拡張
+            dst[i] = v * (1.0f / 8388608.0f);               // 2^23
+        }
+    } else if (chType_[(size_t)c] == ASIOSTInt16LSB) {
+        const int16_t* s = static_cast<const int16_t*>(src);
+        for (long i = 0; i < n; ++i) dst[i] = s[i] * (1.0f / 32768.0f);
     } else { // ASIOSTFloat32LSB
         const float* s = static_cast<const float*>(src);
         for (long i = 0; i < n; ++i) dst[i] = s[i];
@@ -359,6 +393,24 @@ void AsioDevice::ConvertFloatToChannel(int c, long index, const float* src) cons
             float v = src[i];
             v = v > 1.0f ? 1.0f : (v < -1.0f ? -1.0f : v);
             d[i] = static_cast<int32_t>(v * 2147483647.0f);
+        }
+    } else if (chType_[(size_t)c] == ASIOSTInt24LSB) {
+        uint8_t* d = static_cast<uint8_t*>(dstRaw);
+        for (long i = 0; i < n; ++i) {
+            float v = src[i];
+            v = v > 1.0f ? 1.0f : (v < -1.0f ? -1.0f : v);
+            int32_t iv = static_cast<int32_t>(v * 8388607.0f);
+            uint8_t* b = d + i * 3;
+            b[0] = (uint8_t)(iv & 0xFF);
+            b[1] = (uint8_t)((iv >> 8) & 0xFF);
+            b[2] = (uint8_t)((iv >> 16) & 0xFF);
+        }
+    } else if (chType_[(size_t)c] == ASIOSTInt16LSB) {
+        int16_t* d = static_cast<int16_t*>(dstRaw);
+        for (long i = 0; i < n; ++i) {
+            float v = src[i];
+            v = v > 1.0f ? 1.0f : (v < -1.0f ? -1.0f : v);
+            d[i] = static_cast<int16_t>(v * 32767.0f);
         }
     } else {
         float* d = static_cast<float*>(dstRaw);

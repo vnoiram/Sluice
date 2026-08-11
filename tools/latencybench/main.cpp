@@ -10,10 +10,11 @@
 // xcorr.h(信号生成・相互相関)のみ Windows API 非依存でありオフライン
 // 検証済み(tests/test_xcorr.cpp)。
 //
-// 現状のスコープ: accessMethod は WASAPI 共有モードと DirectKS
-// (engine/device/ks_device.h)のみ対応。WASAPI 排他モードは engine/ 側の
-// WasapiDevice が現状共有モードしか実装していないため未対応(TODO、
-// §7.3 の測定軸としては将来追加)。
+// スコープ: accessMethod は WASAPI 共有モード・WASAPI 排他モード
+// (gap 6・9、engine/device/wasapi_device.h の DeviceStreamConfig::
+// exclusiveMode)・DirectKS(engine/device/ks_device.h)に対応。
+// VAC の "ms per int" や VB-CABLE の内部レイテンシ設定の自動スイープは
+// 未対応のまま(実機の仮想ケーブル導入が要るため、gap 9 の残課題)。
 
 #include <windows.h>
 
@@ -31,15 +32,30 @@
 #include "device/vac.h"
 #include "device/vb_cable.h"
 #include "device/wasapi_device.h"
+#include "ipc/json_value.h"
 #include "xcorr.h"
 
 namespace {
 
-enum class AccessMethod { WasapiShared, DirectKs };
+// engine/main.cpp の WideToUtf8 と同じ実装(gap 8: --json 出力で
+// ipc::LatencyMeasurement のフィールドが UTF-8 std::string を要求するため)。
+std::string WideToUtf8(const std::wstring& w) {
+    if (w.empty()) return {};
+    const int len =
+        WideCharToMultiByte(CP_UTF8, 0, w.c_str(), (int)w.size(), nullptr, 0, nullptr, nullptr);
+    std::string out((size_t)len, '\0');
+    WideCharToMultiByte(CP_UTF8, 0, w.c_str(), (int)w.size(), out.data(), len, nullptr, nullptr);
+    return out;
+}
+
+// gap 9: WasapiExclusive を追加(WASAPI 排他モード、gap 6 で
+// DeviceStreamConfig::exclusiveMode が実装されたことで測定可能になった)。
+enum class AccessMethod { WasapiShared, WasapiExclusive, DirectKs };
 
 const wchar_t* AccessMethodName(AccessMethod m) {
     switch (m) {
         case AccessMethod::WasapiShared: return L"wasapi_shared";
+        case AccessMethod::WasapiExclusive: return L"wasapi_exclusive";
         case AccessMethod::DirectKs: return L"directks";
     }
     return L"unknown";
@@ -131,12 +147,15 @@ void PrintUsage() {
     std::wprintf(
         L"Usage: latencybench.exe --list\n"
         L"       latencybench.exe --sweep <render-name-substring> <capture-name-substring>\n"
-        L"           [--csv <path>]\n"
+        L"           [--csv <path>] [--json <path>]\n"
         L"\n"
         L"  --list   VB-CABLE/VAC らしき WASAPI デバイスを列挙する\n"
         L"  --sweep  指定した再生/録音デバイス(仮想ケーブルの両端)で\n"
         L"           accessMethod x requestedBufferFrames を総当たりし、\n"
-        L"           CSV を出力する\n");
+        L"           CSV を出力する\n"
+        L"  --json   engine/ipc/latency_db.h が読む形式(gap 8: 実測値を\n"
+        L"           DeviceCaps.measuredLatencyMs へ自動反映するための入力)\n"
+        L"           で測定結果を書き出す。失敗した組み合わせは含めない。\n");
 }
 
 void ListVirtualDevices() {
@@ -174,9 +193,11 @@ int wmain(int argc, wchar_t** argv) {
 
     const std::wstring renderNameSubstr = argv[2];
     const std::wstring captureNameSubstr = argv[3];
-    std::wstring csvPath;
-    for (int i = 4; i + 1 < argc; ++i)
+    std::wstring csvPath, jsonPath;
+    for (int i = 4; i + 1 < argc; ++i) {
         if (wcscmp(argv[i], L"--csv") == 0) csvPath = argv[i + 1];
+        if (wcscmp(argv[i], L"--json") == 0) jsonPath = argv[i + 1];
+    }
 
     // レンダー/キャプチャエンドポイントを名前の部分一致で検索する。
     std::wstring renderId, captureId;
@@ -192,11 +213,16 @@ int wmain(int argc, wchar_t** argv) {
     }
 
     std::vector<uint32_t> bufferSizes = {64, 128, 256, 512};
-    std::vector<AccessMethod> methods = {AccessMethod::WasapiShared, AccessMethod::DirectKs};
+    std::vector<AccessMethod> methods = {AccessMethod::WasapiShared, AccessMethod::WasapiExclusive,
+                                         AccessMethod::DirectKs};
 
     std::vector<std::string> csvLines;
     csvLines.push_back(
-        "device,accessMethod,requestedBufferFrames,effectiveLatencyMs,xrunCount,cpuPercent");
+        "renderDevice,captureDevice,accessMethod,requestedBufferFrames,effectiveLatencyMs,"
+        "xrunCount,cpuPercent");
+    JsonValue jsonResults = JsonValue::MakeArray();
+    const std::string renderNameUtf8 = WideToUtf8(renderNameSubstr);
+    const std::string captureNameUtf8 = WideToUtf8(captureNameSubstr);
 
     for (AccessMethod method : methods) {
         for (uint32_t bufferFrames : bufferSizes) {
@@ -205,9 +231,18 @@ int wmain(int argc, wchar_t** argv) {
             config.sampleRate = 48000.0;
             config.preferredBufferFrames = (long)bufferFrames;
             config.aggressiveLowLatency = true;
+            // gap 9: 排他モードでは共有エンジンの小バッファ要求パスを
+            // 使わない(意味が異なる、engine/device/wasapi_device.cpp の
+            // Open() 参照)。exclusiveMode 自体が唯一のモード切り替えなので
+            // aggressiveLowLatency は無視されるが、明示的に false にして
+            // おく方が意図が伝わる。
+            if (method == AccessMethod::WasapiExclusive) {
+                config.aggressiveLowLatency = false;
+                config.exclusiveMode = true;
+            }
 
             std::unique_ptr<IAudioDevice> renderDevice, captureDevice;
-            if (method == AccessMethod::WasapiShared) {
+            if (method == AccessMethod::WasapiShared || method == AccessMethod::WasapiExclusive) {
                 renderDevice = std::make_unique<wasapi::WasapiDevice>(renderId, false);
                 captureDevice = std::make_unique<wasapi::WasapiDevice>(captureId, true);
             } else {
@@ -249,14 +284,30 @@ int wmain(int argc, wchar_t** argv) {
             renderDevice->Close();
             captureDevice->Close();
 
-            char line[256];
+            char line[512];
             if (r.ok) {
-                std::snprintf(line, sizeof(line), "loopback,%ls,%u,%.3f,%llu,%.2f",
+                std::snprintf(line, sizeof(line), "%s,%s,%ls,%u,%.3f,%llu,%.2f",
+                              renderNameUtf8.c_str(), captureNameUtf8.c_str(),
                               AccessMethodName(method), bufferFrames, r.effectiveLatencyMs,
                               (unsigned long long)r.xrunCount, r.cpuPercent);
+
+                // --json (gap 8): 失敗した組み合わせは含めない
+                // (engine/ipc/latency_db.h::LookupMeasuredLatencyMs は
+                // xrunCount==0 の測定だけを見るので、失敗行を混ぜても実害は
+                // 無いが、意味のある measuredLatencyMs が無いので素直に除外する)。
+                JsonValue entry = JsonValue::MakeObject();
+                entry["renderDevice"] = renderNameUtf8;
+                entry["captureDevice"] = captureNameUtf8;
+                entry["accessMethod"] = WideToUtf8(AccessMethodName(method));
+                entry["requestedBufferFrames"] = (int)bufferFrames;
+                entry["measuredLatencyMs"] = r.effectiveLatencyMs;
+                entry["xrunCount"] = (double)r.xrunCount;
+                entry["cpuPercent"] = r.cpuPercent;
+                jsonResults.Push(entry);
             } else {
-                std::snprintf(line, sizeof(line), "loopback,%ls,%u,FAILED,,", AccessMethodName(method),
-                              bufferFrames);
+                std::snprintf(line, sizeof(line), "%s,%s,%ls,%u,FAILED,,",
+                              renderNameUtf8.c_str(), captureNameUtf8.c_str(),
+                              AccessMethodName(method), bufferFrames);
             }
             csvLines.push_back(line);
             std::wprintf(L"%hs\n", line);
@@ -266,6 +317,14 @@ int wmain(int argc, wchar_t** argv) {
     if (!csvPath.empty()) {
         std::wofstream out(csvPath);
         for (const auto& l : csvLines) out << l.c_str() << L"\n";
+    }
+    if (!jsonPath.empty()) {
+        // std::ofstream の wstring パス受け取りは MSVC の拡張(csvPath の
+        // std::wofstream と同じ理由でこのファイルは MSVC 専用)。中身は
+        // UTF-8 の JSON テキストなのでバイト列として書けばよく、
+        // std::wofstream(ワイド文字ストリーム)ではなく素の std::ofstream を使う。
+        std::ofstream out(jsonPath);
+        out << jsonResults.Dump();
     }
 
     return 0;

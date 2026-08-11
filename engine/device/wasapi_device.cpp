@@ -97,6 +97,44 @@ std::wstring GetFriendlyName(IMMDevice* device) {
 }  // namespace
 
 // ===========================================================================
+// 排他モード(実装ガイド §5.2.5)
+// ===========================================================================
+// SubFormat GUID は「先頭 4 バイト(Data1)=通常の wFormatTag 値、残りは
+// 固定の PCM/IEEE_FLOAT サブタイプの定型サフィックス」という規約(このファイル
+// 内の formatTag 判定と対称、ksmedia.h の KSDATAFORMAT_SUBTYPE_* 定数は
+// 持ち込まずに済む)。
+WAVEFORMATEXTENSIBLE WasapiDevice::BuildCandidateFormat(const DeviceStreamConfig& config,
+                                                        bool floatFormat) {
+    WAVEFORMATEXTENSIBLE fmt{};
+    const WORD bits = floatFormat ? 32 : 16;
+    const WORD blockAlign = (WORD)(config.channels * (bits / 8));
+
+    fmt.Format.wFormatTag = WAVE_FORMAT_EXTENSIBLE;
+    fmt.Format.nChannels = (WORD)config.channels;
+    fmt.Format.nSamplesPerSec = (DWORD)config.sampleRate;
+    fmt.Format.wBitsPerSample = bits;
+    fmt.Format.nBlockAlign = blockAlign;
+    fmt.Format.nAvgBytesPerSec = fmt.Format.nSamplesPerSec * blockAlign;
+    fmt.Format.cbSize = 22;  // sizeof(WAVEFORMATEXTENSIBLE) - sizeof(WAVEFORMATEX)
+    fmt.Samples.wValidBitsPerSample = bits;
+    // チャンネルマスク: 2ch 以下の一般的な配置のみ扱う(3ch 以上は将来課題)。
+    // SPEAKER_FRONT_LEFT/RIGHT/CENTER の値(ksmedia.h 由来だが定義場所に
+    // 依存したくないためリテラルで書く。値自体は Win32 の固定 ABI)。
+    constexpr DWORD kSpeakerFrontLeft = 0x1;
+    constexpr DWORD kSpeakerFrontRight = 0x2;
+    constexpr DWORD kSpeakerFrontCenter = 0x4;
+    fmt.dwChannelMask = (config.channels >= 2) ? (kSpeakerFrontLeft | kSpeakerFrontRight)
+                                               : kSpeakerFrontCenter;
+    fmt.SubFormat.Data1 = floatFormat ? WAVE_FORMAT_IEEE_FLOAT : WAVE_FORMAT_PCM;
+    fmt.SubFormat.Data2 = 0x0000;
+    fmt.SubFormat.Data3 = 0x0010;
+    static const uint8_t kSubFormatSuffix[8] = {0x80, 0x00, 0x00, 0xaa,
+                                                0x00, 0x38, 0x9b, 0x71};
+    std::memcpy(fmt.SubFormat.Data4, kSubFormatSuffix, sizeof(kSubFormatSuffix));
+    return fmt;
+}
+
+// ===========================================================================
 // エンドポイント列挙
 // ===========================================================================
 std::vector<EndpointInfo> EnumerateEndpoints(bool isCapture) {
@@ -318,85 +356,145 @@ bool WasapiDevice::Open(const DeviceStreamConfig& config, std::wstring* errorOut
                                  reinterpret_cast<void**>(&audioClient_))))
         return fail(L"IAudioClient Activate failed");
 
-    WAVEFORMATEX* mixFormat = nullptr;
-    if (FAILED(audioClient_->GetMixFormat(&mixFormat)) || !mixFormat)
-        return fail(L"GetMixFormat failed");
-
-    channels_ = mixFormat->nChannels;
-    sampleRate_ = mixFormat->nSamplesPerSec;
-
-    // ミックスフォーマットの実体判定。WAVE_FORMAT_EXTENSIBLE の場合、
-    // SubFormat GUID は「先頭 4 バイト(Data1)=通常の wFormatTag 値」という
-    // 規約で作られているため、専用の GUID 定数を持ち込まなくても判定できる。
-    WORD formatTag = mixFormat->wFormatTag;
-    if (formatTag == WAVE_FORMAT_EXTENSIBLE) {
-        auto* ext = reinterpret_cast<WAVEFORMATEXTENSIBLE*>(mixFormat);
-        formatTag = (WORD)ext->SubFormat.Data1;
-    }
-    if (formatTag == WAVE_FORMAT_IEEE_FLOAT) {
-        formatIsFloat_ = true;
-        bitsPerSample_ = 32;
-    } else if (formatTag == WAVE_FORMAT_PCM) {
-        formatIsFloat_ = false;
-        bitsPerSample_ = mixFormat->wBitsPerSample;
-        if (bitsPerSample_ != 16 && bitsPerSample_ != 24 && bitsPerSample_ != 32) {
-            CoTaskMemFree(mixFormat);
-            return fail(L"unsupported PCM bit depth (16/24/32 only)");
-        }
-    } else {
-        CoTaskMemFree(mixFormat);
-        return fail(L"unsupported WASAPI mix format (PCM/IEEE_FLOAT only)");
-    }
-
-    // 低遅延パス(実装ガイド §5.2.1〜§5.2.3): config.aggressiveLowLatency が
-    // true のときだけ IAudioClient3 の小バッファ要求パスを試す。既定
-    // (false)ではデバイス既定周期(defaultPeriod)で開く ——
-    // 小バッファ要求は同じエンドポイントを使う他アプリを巻き込むため、
-    // オプトインにする(実装ガイド §5.2.3「誠実さの問題」)。
     bool initialized = false;
-    IAudioClient3* client3 = nullptr;
-    if (SUCCEEDED(audioClient_->QueryInterface(__uuidof(IAudioClient3),
-                                               reinterpret_cast<void**>(&client3)))) {
-        UINT32 defaultPeriod = 0, fundamentalPeriod = 0, minPeriod = 0, maxPeriod = 0;
-        if (QuerySharedModePeriod(audioClient_, mixFormat, config.rawMode, &defaultPeriod,
-                                   &fundamentalPeriod, &minPeriod, &maxPeriod)) {
-            UINT32 periodFrames = defaultPeriod;
-            if (config.aggressiveLowLatency && config.preferredBufferFrames > 0) {
-                periodFrames = wasapi::ChoosePeriodFrames(
-                    (UINT32)config.preferredBufferFrames, minPeriod, maxPeriod, fundamentalPeriod);
-            }
+    if (!config.exclusiveMode) {
+        WAVEFORMATEX* mixFormat = nullptr;
+        if (FAILED(audioClient_->GetMixFormat(&mixFormat)) || !mixFormat)
+            return fail(L"GetMixFormat failed");
 
-            HRESULT hrInit = client3->InitializeSharedAudioStream(
-                AUDCLNT_STREAMFLAGS_EVENTCALLBACK, periodFrames, mixFormat, nullptr);
+        channels_ = mixFormat->nChannels;
+        sampleRate_ = mixFormat->nSamplesPerSec;
 
-            if (hrInit == AUDCLNT_E_ENGINE_PERIODICITY_LOCKED) {
-                // 実装ガイド §5.2.2: 複数の WASAPI デバイスを同時に開く
-                // 本アプリでは頻繁に起きるため、正常系として扱う。現在の
-                // エンジン周期を問い合わせて合わせる(10ms フォールバックへは
-                // 落とさない)。
-                WAVEFORMATEX* curFmt = nullptr;
-                UINT32 curPeriod = 0;
-                if (SUCCEEDED(client3->GetCurrentSharedModeEnginePeriod(&curFmt, &curPeriod))) {
-                    hrInit = client3->InitializeSharedAudioStream(
-                        AUDCLNT_STREAMFLAGS_EVENTCALLBACK, curPeriod, curFmt, nullptr);
-                    if (curFmt) CoTaskMemFree(curFmt);
-                }
-            }
-            initialized = SUCCEEDED(hrInit);
+        // ミックスフォーマットの実体判定。WAVE_FORMAT_EXTENSIBLE の場合、
+        // SubFormat GUID は「先頭 4 バイト(Data1)=通常の wFormatTag 値」という
+        // 規約で作られているため、専用の GUID 定数を持ち込まなくても判定できる。
+        WORD formatTag = mixFormat->wFormatTag;
+        if (formatTag == WAVE_FORMAT_EXTENSIBLE) {
+            auto* ext = reinterpret_cast<WAVEFORMATEXTENSIBLE*>(mixFormat);
+            formatTag = (WORD)ext->SubFormat.Data1;
         }
-        client3->Release();
+        if (formatTag == WAVE_FORMAT_IEEE_FLOAT) {
+            formatIsFloat_ = true;
+            bitsPerSample_ = 32;
+        } else if (formatTag == WAVE_FORMAT_PCM) {
+            formatIsFloat_ = false;
+            bitsPerSample_ = mixFormat->wBitsPerSample;
+            if (bitsPerSample_ != 16 && bitsPerSample_ != 24 && bitsPerSample_ != 32) {
+                CoTaskMemFree(mixFormat);
+                return fail(L"unsupported PCM bit depth (16/24/32 only)");
+            }
+        } else {
+            CoTaskMemFree(mixFormat);
+            return fail(L"unsupported WASAPI mix format (PCM/IEEE_FLOAT only)");
+        }
+
+        // 低遅延パス(実装ガイド §5.2.1〜§5.2.3): config.aggressiveLowLatency が
+        // true のときだけ IAudioClient3 の小バッファ要求パスを試す。既定
+        // (false)ではデバイス既定周期(defaultPeriod)で開く ——
+        // 小バッファ要求は同じエンドポイントを使う他アプリを巻き込むため、
+        // オプトインにする(実装ガイド §5.2.3「誠実さの問題」)。
+        IAudioClient3* client3 = nullptr;
+        if (SUCCEEDED(audioClient_->QueryInterface(__uuidof(IAudioClient3),
+                                                   reinterpret_cast<void**>(&client3)))) {
+            UINT32 defaultPeriod = 0, fundamentalPeriod = 0, minPeriod = 0, maxPeriod = 0;
+            if (QuerySharedModePeriod(audioClient_, mixFormat, config.rawMode, &defaultPeriod,
+                                       &fundamentalPeriod, &minPeriod, &maxPeriod)) {
+                UINT32 periodFrames = defaultPeriod;
+                if (config.aggressiveLowLatency && config.preferredBufferFrames > 0) {
+                    periodFrames = wasapi::ChoosePeriodFrames(
+                        (UINT32)config.preferredBufferFrames, minPeriod, maxPeriod, fundamentalPeriod);
+                }
+
+                HRESULT hrInit = client3->InitializeSharedAudioStream(
+                    AUDCLNT_STREAMFLAGS_EVENTCALLBACK, periodFrames, mixFormat, nullptr);
+
+                if (hrInit == AUDCLNT_E_ENGINE_PERIODICITY_LOCKED) {
+                    // 実装ガイド §5.2.2: 複数の WASAPI デバイスを同時に開く
+                    // 本アプリでは頻繁に起きるため、正常系として扱う。現在の
+                    // エンジン周期を問い合わせて合わせる(10ms フォールバックへは
+                    // 落とさない)。
+                    WAVEFORMATEX* curFmt = nullptr;
+                    UINT32 curPeriod = 0;
+                    if (SUCCEEDED(client3->GetCurrentSharedModeEnginePeriod(&curFmt, &curPeriod))) {
+                        hrInit = client3->InitializeSharedAudioStream(
+                            AUDCLNT_STREAMFLAGS_EVENTCALLBACK, curPeriod, curFmt, nullptr);
+                        if (curFmt) CoTaskMemFree(curFmt);
+                    }
+                }
+                initialized = SUCCEEDED(hrInit);
+            }
+            client3->Release();
+        }
+        if (!initialized) {
+            // IAudioClient3 非対応、またはロック後の再初期化も失敗した場合の
+            // 最終フォールバック: 10ms 周期を要求(100ns 単位: 1ms = 10,000)。
+            constexpr REFERENCE_TIME kBufferDuration = 10 * 10000;
+            initialized = SUCCEEDED(audioClient_->Initialize(
+                AUDCLNT_SHAREMODE_SHARED, AUDCLNT_STREAMFLAGS_EVENTCALLBACK,
+                kBufferDuration, 0, mixFormat, nullptr));
+        }
+        CoTaskMemFree(mixFormat);
+        mixFormat = nullptr;
+        if (!initialized) return fail(L"IAudioClient Initialize failed");
+    } else {
+        // 排他モード(実装ガイド §5.2.5)。GetMixFormat は共有エンジン専用の
+        // 概念のため使えない。config から候補フォーマットを組み立て、
+        // IsFormatSupported(EXCLUSIVE, ...) で確認する
+        // (排他モードでは ppClosestMatch は必ず nullptr — 非 null を渡すと
+        // E_INVALIDARG になる。共有モードのような「近い形式への丸め」機能は
+        // そもそも無い)。
+        channels_ = config.channels;
+        sampleRate_ = config.sampleRate;
+
+        WAVEFORMATEXTENSIBLE fmt = BuildCandidateFormat(config, /*floatFormat=*/true);
+        HRESULT hrFmt = audioClient_->IsFormatSupported(
+            AUDCLNT_SHAREMODE_EXCLUSIVE, reinterpret_cast<WAVEFORMATEX*>(&fmt), nullptr);
+        if (FAILED(hrFmt)) {
+            fmt = BuildCandidateFormat(config, /*floatFormat=*/false);  // 16bit PCM へフォールバック
+            hrFmt = audioClient_->IsFormatSupported(
+                AUDCLNT_SHAREMODE_EXCLUSIVE, reinterpret_cast<WAVEFORMATEX*>(&fmt), nullptr);
+        }
+        if (FAILED(hrFmt))
+            return fail(L"exclusive mode: no supported format at the requested rate/channels");
+
+        formatIsFloat_ = (fmt.SubFormat.Data1 == WAVE_FORMAT_IEEE_FLOAT);
+        bitsPerSample_ = fmt.Format.wBitsPerSample;
+
+        REFERENCE_TIME defaultPeriod = 0, minPeriod = 0;
+        if (FAILED(audioClient_->GetDevicePeriod(&defaultPeriod, &minPeriod)))
+            return fail(L"exclusive mode: GetDevicePeriod failed");
+        REFERENCE_TIME reqPeriod = defaultPeriod;
+        if (config.preferredBufferFrames > 0) {
+            const REFERENCE_TIME want = (REFERENCE_TIME)(
+                (double)config.preferredBufferFrames * 1.0e7 / sampleRate_ + 0.5);
+            reqPeriod = std::max(want, minPeriod);
+        }
+
+        HRESULT hrInit = audioClient_->Initialize(
+            AUDCLNT_SHAREMODE_EXCLUSIVE, AUDCLNT_STREAMFLAGS_EVENTCALLBACK, reqPeriod,
+            reqPeriod, reinterpret_cast<WAVEFORMATEX*>(&fmt), nullptr);
+        if (hrInit == AUDCLNT_E_BUFFER_SIZE_NOT_ALIGNED) {
+            // MSDN の既定手順: 一度アラインされたバッファサイズを取得し、
+            // IAudioClient を作り直して同じ長さ(秒換算)で再 Initialize する
+            // (排他モード特有の要求。一度 Initialize に失敗した
+            // IAudioClient はそのまま再利用できない)。
+            UINT32 alignedFrames = 0;
+            if (FAILED(audioClient_->GetBufferSize(&alignedFrames)))
+                return fail(L"exclusive mode: GetBufferSize after alignment retry failed");
+            const REFERENCE_TIME alignedPeriod =
+                (REFERENCE_TIME)(1.0e7 * alignedFrames / sampleRate_ + 0.5);
+            audioClient_->Release();
+            audioClient_ = nullptr;
+            if (FAILED(device_->Activate(__uuidof(IAudioClient), CLSCTX_ALL, nullptr,
+                                         reinterpret_cast<void**>(&audioClient_))))
+                return fail(L"exclusive mode: re-Activate after alignment retry failed");
+            hrInit = audioClient_->Initialize(
+                AUDCLNT_SHAREMODE_EXCLUSIVE, AUDCLNT_STREAMFLAGS_EVENTCALLBACK, alignedPeriod,
+                alignedPeriod, reinterpret_cast<WAVEFORMATEX*>(&fmt), nullptr);
+        }
+        initialized = SUCCEEDED(hrInit);
+        if (!initialized) return fail(L"exclusive mode: IAudioClient Initialize failed");
     }
-    if (!initialized) {
-        // IAudioClient3 非対応、またはロック後の再初期化も失敗した場合の
-        // 最終フォールバック: 10ms 周期を要求(100ns 単位: 1ms = 10,000)。
-        constexpr REFERENCE_TIME kBufferDuration = 10 * 10000;
-        initialized = SUCCEEDED(audioClient_->Initialize(
-            AUDCLNT_SHAREMODE_SHARED, AUDCLNT_STREAMFLAGS_EVENTCALLBACK,
-            kBufferDuration, 0, mixFormat, nullptr));
-    }
-    CoTaskMemFree(mixFormat);
-    mixFormat = nullptr;
-    if (!initialized) return fail(L"IAudioClient Initialize failed");
 
     if (FAILED(audioClient_->GetBufferSize(&periodFrames_)))
         return fail(L"GetBufferSize failed");
@@ -444,13 +542,57 @@ void WasapiDevice::Start() {
     if (!audioClient_ || running_.load()) return;
     if (FAILED(audioClient_->Start())) return;
     running_.store(true);
-    thread_ = std::thread(&WasapiDevice::ThreadMain, this);
+
+    // gap 5: まず RTWQ 経路を試す(rtwq_worker.h の設計コメント参照:
+    // 対応 OS でない、または DLL ロード/ロック取得/初回キューイングの
+    // いずれかに失敗したら、既存の std::thread 経路にフォールバックする)。
+    rtwqActive_ = false;
+    if (rtwq::Api::Instance().Supported()) {
+        DWORD taskId = 0;
+        if (SUCCEEDED(rtwq::Api::Instance().LockSharedWorkQueue(L"Pro Audio", &taskId,
+                                                                 &rtwqQueueId_)) &&
+            SUCCEEDED(rtwq::Api::Instance().CreateAsyncResult(&rtwqCallback_, &rtwqAsyncResult_))) {
+            rtwqCallback_.SetQueueId(rtwqQueueId_);
+            if (!rtwqIdleEvent_) rtwqIdleEvent_ = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+            if (rtwqIdleEvent_ &&
+                SUCCEEDED(rtwq::Api::Instance().PutWaitingWorkItem(audioEvent_, rtwqAsyncResult_))) {
+                rtwqActive_ = true;
+            }
+        }
+        if (!rtwqActive_) {
+            // 部分的に確保したリソースを片付けて、下のフォールバックへ進む。
+            if (rtwqAsyncResult_) { rtwqAsyncResult_->Release(); rtwqAsyncResult_ = nullptr; }
+            if (rtwqQueueId_ != 0) {
+                rtwq::Api::Instance().UnlockWorkQueue(rtwqQueueId_);
+                rtwqQueueId_ = 0;
+            }
+        }
+    }
+    if (!rtwqActive_) {
+        thread_ = std::thread(&WasapiDevice::ThreadMain, this);
+    }
 }
 
 void WasapiDevice::Stop() {
     if (running_.exchange(false)) {
-        if (stopEvent_) SetEvent(stopEvent_);
-        if (thread_.joinable()) thread_.join();
+        if (rtwqActive_) {
+            // 保留中の RtwqPutWaitingWorkItem を起こして、Invoke 側に
+            // running_==false を気付かせる(OBS の WASAPISource::Stop() と
+            // 同じ手筋: 待っているのと同じハンドルを SetEvent しないと
+            // 起きてくれない)。Invoke が「もう再キューしない」と決めたら
+            // rtwqIdleEvent_ を立てるので、それを待ってから片付ける。
+            if (audioEvent_) SetEvent(audioEvent_);
+            if (rtwqIdleEvent_) WaitForSingleObject(rtwqIdleEvent_, 5000);
+            if (rtwqAsyncResult_) { rtwqAsyncResult_->Release(); rtwqAsyncResult_ = nullptr; }
+            if (rtwqQueueId_ != 0) {
+                rtwq::Api::Instance().UnlockWorkQueue(rtwqQueueId_);
+                rtwqQueueId_ = 0;
+            }
+            rtwqActive_ = false;
+        } else {
+            if (stopEvent_) SetEvent(stopEvent_);
+            if (thread_.joinable()) thread_.join();
+        }
     }
     if (audioClient_) audioClient_->Stop();
 }
@@ -470,6 +612,7 @@ void WasapiDevice::Close() {
     if (enumerator_)    { enumerator_->Release();     enumerator_    = nullptr; }
     if (audioEvent_)    { CloseHandle(audioEvent_);   audioEvent_    = nullptr; }
     if (stopEvent_)     { CloseHandle(stopEvent_);    stopEvent_     = nullptr; }
+    if (rtwqIdleEvent_) { CloseHandle(rtwqIdleEvent_); rtwqIdleEvent_ = nullptr; }
 
     rings_.clear();
     channelScratch_.clear();
@@ -502,7 +645,42 @@ DeviceStatus WasapiDevice::Status() const {
 }
 
 // ===========================================================================
-// RT(専用スレッド)側
+// RT 側: audioEvent_ が 1 回シグナルされたときの処理本体。
+// フォールバック経路(ThreadMain、専用スレッド)と RTWQ 経路
+// (RtwqCallback::Invoke、OS 共有ワークキュー上)の両方から呼ばれる、
+// 完全に共通のロジック(gap 5)。
+// ===========================================================================
+void WasapiDevice::OnAudioSignal() {
+    cbCount_.fetch_add(1, std::memory_order_relaxed);
+    if (isCapture_) {
+        ProcessOneCapture();
+    } else {
+        UINT32 padding = 0;
+        if (SUCCEEDED(audioClient_->GetCurrentPadding(&padding))) {
+            UINT32 available = periodFrames_ > padding ? periodFrames_ - padding : 0;
+            if (available > 0) ProcessOneRender(available);
+        }
+    }
+}
+
+HRESULT STDMETHODCALLTYPE WasapiDevice::RtwqCallback::Invoke(IRtwqAsyncResult* /*result*/) {
+    if (owner_->running_.load(std::memory_order_acquire)) {
+        owner_->OnAudioSignal();
+    }
+    // OnAudioSignal() の実行中に Stop() が呼ばれた可能性もあるため、
+    // 再アームするかどうかは実行後にもう一度確認する
+    // (「止めたはずなのに次のコールバックが来る」事故を防ぐ)。
+    if (owner_->running_.load(std::memory_order_acquire)) {
+        rtwq::Api::Instance().PutWaitingWorkItem(owner_->audioEvent_, owner_->rtwqAsyncResult_);
+    } else if (owner_->rtwqIdleEvent_) {
+        SetEvent(owner_->rtwqIdleEvent_);
+    }
+    return S_OK;
+}
+
+// ===========================================================================
+// フォールバック経路: RTWQ が使えない(セットアップ失敗・非対応 OS)場合の
+// 専用スレッド + イベント駆動ループ(gap 5、rtwq_worker.h 参照)。
 // ===========================================================================
 void WasapiDevice::ThreadMain() {
     // このスレッド専用の COM 初期化(main スレッドの STA とは別)
@@ -517,16 +695,7 @@ void WasapiDevice::ThreadMain() {
         if (wait == WAIT_OBJECT_0) break;               // stopEvent_
         if (wait != WAIT_OBJECT_0 + 1) continue;         // それ以外は無視して再待機
 
-        cbCount_.fetch_add(1, std::memory_order_relaxed);
-        if (isCapture_) {
-            ProcessOneCapture();
-        } else {
-            UINT32 padding = 0;
-            if (SUCCEEDED(audioClient_->GetCurrentPadding(&padding))) {
-                UINT32 available = periodFrames_ > padding ? periodFrames_ - padding : 0;
-                if (available > 0) ProcessOneRender(available);
-            }
-        }
+        OnAudioSignal();
     }
 
     if (avrtHandle) AvRevertMmThreadCharacteristics(avrtHandle);

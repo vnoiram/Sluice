@@ -65,6 +65,16 @@ if(MSVC)
 endif()
 add_test(NAME device_report_json COMMAND test_device_report_json)
 
+# tools/latencybench の実測値 → DeviceCaps.measuredLatencyMs 反映
+# (engine/ipc/latency_db.h、gap 8)のオフライン回帰テスト。Windows API に
+# 依存しない。
+add_executable(test_latency_db test_latency_db.cpp)
+target_include_directories(test_latency_db PRIVATE ${CMAKE_SOURCE_DIR})
+if(MSVC)
+    target_compile_options(test_latency_db PRIVATE /W4 /permissive-)
+endif()
+add_test(NAME latency_db COMMAND test_latency_db)
+
 # 名前付きパイプ IPC サーバ(engine/ipc/pipe_server.h)の実結合テスト
 # (実装ガイド §5.6)。名前付きパイプはオーディオデバイス/サービス不要の
 # 基本 OS 機能なので、WasapiDevice 系と違いここは実際に ctest で実行する。

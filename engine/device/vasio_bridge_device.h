@@ -29,9 +29,10 @@
 //   - 常に kMaxChannels(8)チャンネル固定で開く(DeviceStreamConfig.channels は
 //     参照しない。vasio.dll 側も既定 8in/8out 固定のため、要求チャンネル数を
 //     絞る意味が薄い)
-//   - kAsioResetRequest 相当の「エンジン側からの ResetPending 送出」は未実装
-//     (このデバイス自身が resetRequested を立てることは無い。エンジン側の
-//     設定変更を DAW に伝える経路は将来課題)
+//   - kAsioResetRequest 相当の「エンジン側からの ResetPending 送出」は
+//     RequestDawReset()(下記)で実装済み(実装ガイド §8.1 手順6)。呼び出しは
+//     main.cpp の監視ループが「マスタークロックのブロックサイズが変わった」
+//     ことを検出したときに行う(このデバイス自身が自発的に検出することはない)。
 //   - Windows 実機/DAW での実接続確認は未実施(vasio.dll 側と同様、この
 //     フェーズはビルド・オフラインロジックの実装までが対象)
 
@@ -95,6 +96,15 @@ public:
     // 共有メモリ未接続(mappedBase_ が null、または相手がまだ
     // ringCapacityFrames を確定していない)の間は何もしない。
     void PumpSharedMemory(int frames);
+
+    // 実装ガイド §8.1 手順6: エンジン側の設定変化(マスタークロックの
+    // ブロックサイズ変更等)を DAW に伝える。vasio.dll(vasio_driver.cpp の
+    // PumpOneBuffer)は ResetPending を見たら kAsioResetRequest を DAW へ
+    // 一度送出し、自分で Connected に戻す — この関数はその ResetPending
+    // への遷移だけを行う(vasio.dll 側は変更しない)。
+    // 接続中(Connected)でなければ何もしない(Disconnected を誤って
+    // 上書きしない、共有メモリ未接続時も安全に no-op)。
+    void RequestDawReset();
 
     int Channels() const { return channels_; }
 

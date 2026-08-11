@@ -59,18 +59,52 @@ private:
     bool prefilled_ = false;
 };
 
+// OutputBoundary: InputBoundary と対称。非マスターの出力デバイス 1 つに
+// つき 1 つ(代表チャンネルの RenderRing を参照して充填率を読む)。
+// producer 側(エンジンが書き込む側)なので InputBoundary のような
+// プリフィル待ちの概念は無い — 起動直後から普通に書き始めてよい
+// (最初のブロックでリングがまだ空でも、通常のドリフト補正が働いて
+// 充填率 50% へ収束していく)。
+class OutputBoundary {
+public:
+    explicit OutputBoundary(SpscRing<float>& referenceRing) : ring_(referenceRing) {}
+
+    // バス処理の直前で 1 回呼ぶ。AsrcWriter::Write に渡す srcRatio を返す。
+    double UpdateAndGetRatio() {
+        const double fill = fillEma_.Push(ring_.FillRatio());
+        const double driftRatio = drift_.Update(fill);
+        return 1.0 / driftRatio;
+    }
+
+    // 所属するいずれかの出力リングでオーバーランが起きたら呼ぶ
+    // (InputBoundary::NotifyUnderrun と対称。現時点では専用の巻き戻し
+    // 処理は無いが、将来 PI コントローラの積分項リセット等に使える
+    // ようフックだけ用意しておく)。
+    void NotifyOverrun() {}
+
+private:
+    SpscRing<float>& ring_;
+    DriftController drift_;
+    Ema fillEma_{0.99};
+};
+
 class EngineGraph {
 public:
     EngineGraph(std::vector<InputBoundary> boundaries, std::vector<StripRuntime> strips,
-               std::vector<BusRuntime> buses)
+               std::vector<BusRuntime> buses,
+               std::vector<OutputBoundary> outputBoundaries = {})
         : boundaries_(std::move(boundaries)),
           strips_(std::move(strips)),
           buses_(std::move(buses)),
+          outputBoundaries_(std::move(outputBoundaries)),
           boundaryRatio_(boundaries_.size(), 1.0),
           boundaryReady_(boundaries_.size(), false),
           boundaryUnderrun_(boundaries_.size(), false),
-          boundaryRatioForUi_(boundaries_.size()) {
+          boundaryRatioForUi_(boundaries_.size()),
+          outputBoundaryRatio_(outputBoundaries_.size(), 1.0),
+          outputBoundaryRatioForUi_(outputBoundaries_.size()) {
         for (auto& a : boundaryRatioForUi_) a.store(1.0, std::memory_order_relaxed);
+        for (auto& a : outputBoundaryRatioForUi_) a.store(1.0, std::memory_order_relaxed);
     }
 
     // マスターコールバックから毎ブロック呼ぶ(実装ガイド §5.4.1)。
@@ -78,6 +112,9 @@ public:
         for (size_t i = 0; i < boundaries_.size(); ++i)
             boundaryReady_[i] = boundaries_[i].UpdateAndGetRatio(&boundaryRatio_[i]);
         std::fill(boundaryUnderrun_.begin(), boundaryUnderrun_.end(), false);
+
+        for (size_t i = 0; i < outputBoundaries_.size(); ++i)
+            outputBoundaryRatio_[i] = outputBoundaries_[i].UpdateAndGetRatio();
 
         bool anySolo = false;
         for (const auto& s : strips_) {
@@ -97,8 +134,13 @@ public:
         for (size_t bi = 0; bi < boundaries_.size(); ++bi)
             if (boundaryUnderrun_[bi]) boundaries_[bi].NotifyUnderrun();
 
-        for (size_t bi = 0; bi < buses_.size(); ++bi)
-            buses_[bi].MixAndWrite(strips_, (int)bi, frames);
+        for (size_t bi = 0; bi < buses_.size(); ++bi) {
+            const int obi = buses_[bi].OutputBoundaryIndex();
+            const double ratio = (obi >= 0) ? outputBoundaryRatio_[(size_t)obi] : 1.0;
+            buses_[bi].MixAndWrite(strips_, (int)bi, frames, ratio);
+            if (obi >= 0 && buses_[bi].ConsumeOverrun())
+                outputBoundaries_[(size_t)obi].NotifyOverrun();
+        }
 
         // 制御/IPC スレッドが実装ガイド §5.6「ASRC の現在比」を読めるように、
         // ready なバウンダリの比だけ atomic へ書く(§4.4 の Phase-0 実装の
@@ -107,6 +149,8 @@ public:
         for (size_t bi = 0; bi < boundaries_.size(); ++bi)
             if (boundaryReady_[bi])
                 boundaryRatioForUi_[bi].store(boundaryRatio_[bi], std::memory_order_relaxed);
+        for (size_t bi = 0; bi < outputBoundaries_.size(); ++bi)
+            outputBoundaryRatioForUi_[bi].store(outputBoundaryRatio_[bi], std::memory_order_relaxed);
     }
 
     StripRuntime& Strip(size_t i) { return strips_[i]; }
@@ -114,6 +158,7 @@ public:
     size_t StripCount() const { return strips_.size(); }
     size_t BusCount() const { return buses_.size(); }
     size_t BoundaryCount() const { return boundaries_.size(); }
+    size_t OutputBoundaryCount() const { return outputBoundaries_.size(); }
 
     // 制御/IPC スレッド専用。あるブロックで無音だった(まだプリフィル待ち)
     // 場合は直近の値をそのまま返す(UI 表示用の緩い値でよいため)。
@@ -121,16 +166,24 @@ public:
         return boundaryRatioForUi_[i].load(std::memory_order_relaxed);
     }
 
+    // 制御/IPC スレッド専用。非マスター出力側の直近の ASRC 比。
+    double OutputBoundaryRatioForUi(size_t i) const {
+        return outputBoundaryRatioForUi_[i].load(std::memory_order_relaxed);
+    }
+
 private:
     std::vector<InputBoundary> boundaries_;
     std::vector<StripRuntime> strips_;
     std::vector<BusRuntime> buses_;
+    std::vector<OutputBoundary> outputBoundaries_;
     // Process() 内のワークバッファ。構築時に確保し、要素数を変えず
     // 上書きするだけ(RT 中に伸びない)。
     std::vector<double> boundaryRatio_;
     std::vector<bool> boundaryReady_;
     std::vector<bool> boundaryUnderrun_;
     std::vector<std::atomic<double>> boundaryRatioForUi_;
+    std::vector<double> outputBoundaryRatio_;
+    std::vector<std::atomic<double>> outputBoundaryRatioForUi_;
 };
 
 class GraphHandle {

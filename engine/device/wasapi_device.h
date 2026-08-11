@@ -6,9 +6,18 @@
 //     アプリと相性が悪い)。IAudioClient3::InitializeSharedAudioStream で
 //     対応デバイスなら小さい周期を要求する(非対応時は通常の
 //     IAudioClient::Initialize にフォールバック)。
-//   - イベント駆動(AUDCLNT_STREAMFLAGS_EVENTCALLBACK)+専用スレッド。
-//     スレッドは AvSetMmThreadCharacteristics(L"Pro Audio", ...) で
-//     MMCSS に登録し優先度を確保する。
+//   - 実装ガイド §5.2.5「排他モード」: DeviceStreamConfig::exclusiveMode を
+//     true にすると AUDCLNT_SHAREMODE_EXCLUSIVE で開く(既定は false)。
+//     共有モードでは 64 サンプルが出せないデバイスを救うための最終手段。
+//     どちらのモードを試すかは呼び出し側の判断で、Probe() 自体は常に
+//     共有モード相当の情報を返す(排他モードの事前問い合わせは行わない)。
+//   - イベント駆動(AUDCLNT_STREAMFLAGS_EVENTCALLBACK)。gap 5: 実装ガイドが
+//     64 サンプル運用で推奨する RTWQ(device/rtwq_worker.h、
+//     RtwqLockSharedWorkQueue(L"Pro Audio", ...))を優先し、対応 OS でない
+//     場合やセットアップに失敗した場合だけ、従来の専用 std::thread +
+//     AvSetMmThreadCharacteristics(L"Pro Audio", ...) にフォールバックする
+//     (OBS Studio の win-wasapi.cpp と同じ方針。RTWQ は Win 8.1+ 限定かつ
+//     実運用で稀に問題が報告されているため、必ずフォールバック経路を残す)。
 //   - 共有モードのミックスフォーマット(サンプルレート・チャンネル数)は
 //     決め打ちしない。GetMixFormat の結果をそのまま使い、
 //     DeviceStreamConfig の要求値との差はエンジン境界の ASRC が吸収する
@@ -40,6 +49,7 @@
 #include <vector>
 
 #include "device/iaudio_device.h"
+#include "device/rtwq_worker.h"  // gap 5: RTWQ 経路(利用不可時は std::thread にフォールバック)
 #include "rt/spsc_ring.h"
 
 namespace wasapi {
@@ -87,7 +97,19 @@ public:
     void RequestReset() { resetRequested_.store(true); }
 
 private:
-    void ThreadMain();       // イベント駆動ループ本体(専用スレッド上で実行)
+    // gap 5: RTWQ(利用不可時は std::thread にフォールバック、
+    // rtwq_worker.h の設計コメント参照)経由で1回分の処理をトリガする。
+    class RtwqCallback : public rtwq::AsyncCallback {
+    public:
+        explicit RtwqCallback(WasapiDevice* owner) : owner_(owner) {}
+        HRESULT STDMETHODCALLTYPE Invoke(IRtwqAsyncResult* result) override;
+
+    private:
+        WasapiDevice* owner_;
+    };
+
+    void ThreadMain();       // フォールバック経路: 専用スレッド上のイベント駆動ループ
+    void OnAudioSignal();    // 1 イベントぶんの処理本体(RTWQ/std::thread 両経路が呼ぶ共通部分)
     void ProcessOneCapture();  // GetBuffer 1回分: デインターリーブして CaptureRing へ
     void ProcessOneRender(UINT32 availableFrames);  // RenderRing から読みインターリーブして GetBuffer へ
 
@@ -100,6 +122,14 @@ private:
                                        bool rawMode, UINT32* defaultPeriod,
                                        UINT32* fundamentalPeriod, UINT32* minPeriod,
                                        UINT32* maxPeriod);
+
+    // 排他モード(実装ガイド §5.2.5)用の候補フォーマットを組み立てる。
+    // GetMixFormat が使えない(共有エンジン専用の概念のため)ので、
+    // config から直接組み立てて IsFormatSupported(EXCLUSIVE, ...) で
+    // 確認する側で使う。floatFormat=false なら 16bit PCM を組み立てる
+    // (float32 が拒否された場合のフォールバック用)。
+    static WAVEFORMATEXTENSIBLE BuildCandidateFormat(const DeviceStreamConfig& config,
+                                                      bool floatFormat);
 
     std::wstring endpointId_;
     bool isCapture_;
@@ -126,6 +156,16 @@ private:
     std::atomic<bool> running_{false};
     HANDLE audioEvent_ = nullptr;
     HANDLE stopEvent_ = nullptr;
+
+    // gap 5: RTWQ 経路(rtwq_worker.h 参照)。rtwqActive_ が true の間は
+    // thread_/ThreadMain ではなくこちらが audioEvent_ を監視する。
+    // セットアップ失敗時(古い Windows、RTWorkQ.dll 無し等)は
+    // rtwqActive_ = false のまま既存の thread_ 経路にフォールバックする。
+    RtwqCallback rtwqCallback_{this};
+    IRtwqAsyncResult* rtwqAsyncResult_ = nullptr;
+    DWORD rtwqQueueId_ = 0;
+    HANDLE rtwqIdleEvent_ = nullptr;  // Stop() が RTWQ 側の停止完了を待つための同期イベント
+    bool rtwqActive_ = false;
 
     std::function<void(int frames)> blockCallback_;
     std::atomic<uint64_t> cbCount_{0};

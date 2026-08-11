@@ -26,6 +26,9 @@ public sealed class DeviceInfo
     public bool ResetRequested { get; init; }
     public double AsrcRatio { get; init; }
     public bool Supports64 { get; init; }
+    // tools/latencybench --json の実測値。0 = 未測定(main.cpp が
+    // ipc::LookupMeasuredLatencyMs でマージしなければこのまま、gap 8)。
+    public double MeasuredLatencyMs { get; init; }
 
     public static DeviceInfo FromJson(JsonObject obj) => new()
     {
@@ -44,6 +47,7 @@ public sealed class DeviceInfo
         ResetRequested = GetBool(obj, "resetRequested"),
         AsrcRatio = GetDouble(obj, "asrcRatio"),
         Supports64 = GetBool(obj, "supports64"),
+        MeasuredLatencyMs = GetDouble(obj, "measuredLatencyMs"),
     };
 
     private static string GetString(JsonObject obj, string key) =>

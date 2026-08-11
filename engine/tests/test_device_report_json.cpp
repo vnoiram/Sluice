@@ -29,6 +29,7 @@ static void TestBasicFields() {
     DeviceCaps caps;
     caps.supports64 = true;
     caps.recommendedLane = Lane::RT;
+    caps.measuredLatencyMs = 2.958;
 
     JsonValue v = ipc::DeviceReportToJson("wasapi:capture:{guid}", "Microphone", "wasapi",
                                           /*isCapture=*/true, status, caps, /*asrcRatio=*/1.0000132);
@@ -44,6 +45,7 @@ static void TestBasicFields() {
     CHECK(v.At("xrunCount").AsNumber() == 3.0);  // underrun(1) + overrun(2)
     CHECK(v.At("resetRequested").AsBool() == false);
     CHECK(v.At("supports64").AsBool() == true);
+    CHECK(v.At("measuredLatencyMs").AsNumber() == 2.958);
 
     // 往復(Dump→Parse)しても壊れないこと。
     JsonValue reparsed = JsonValue::Parse(v.Dump());

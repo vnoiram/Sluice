@@ -90,7 +90,9 @@ regsvr32 build\Release\vasio.dll
   (実機での DAW 互換性確認は REAPER → Cubase → Ableton → OBS-ASIO の順、
   実装ガイド §8.1「テスト」)
 - エンジン側からの `kAsioResetRequest` 送出(レート/バッファサイズ変更を
-  DAW に伝える経路)は未実装。`ResetPending` を書き込む側の実装が無い
+  DAW に伝える経路)は実装済み(`VasioBridgeDevice::RequestDawReset()`、
+  `engine/main.cpp` の監視ループがマスタークロックのブロックサイズ変化を
+  検出したときに呼ぶ)。Windows 実機・実 DAW での動作確認は未実施
 - 32bit DAW 対応、複数インスタンス対応は将来課題
 
 ## 注意

@@ -197,7 +197,8 @@ bool KsDevice::OpenFilter(std::wstring* errorOut) {
 // ===========================================================================
 // ピン探索・生成(実装ガイド §6.1 手順3〜4)
 // ===========================================================================
-bool KsDevice::FindAndCreatePin(const DeviceStreamConfig& config, std::wstring* errorOut) {
+bool KsDevice::FindAndCreatePin(const DeviceStreamConfig& config, UINT32 desiredPeriodFrames,
+                                std::wstring* errorOut) {
     // 手順3: KSPROPERTY_PIN_CTYPES でピン総数を取得し、各ピンの DATAFLOW を見る。
     ULONG pinCount = 0, bytesReturned = 0;
     if (!QueryKsProperty(filterHandle_, KSPROPSETID_Pin, KSPROPERTY_PIN_CTYPES, -1, &pinCount,
@@ -251,17 +252,22 @@ bool KsDevice::FindAndCreatePin(const DeviceStreamConfig& config, std::wstring* 
         }
         if (!acceptsFloatOrPcm) continue;
 
-        // 手順4: 要求フォーマットを組み立てて KsCreatePin。まず Float32 で試し、
-        // 拒否されたら 16bit PCM にフォールバックする。
+        // 手順4: 要求フォーマットを組み立てて KsCreatePin。
+        // gap 7: インターフェースは KSINTERFACE_STANDARD_LOOPED_STREAMING
+        // (WaveRT)を先に試し、フォーマットは Float32 → 16bit PCM の順で
+        // フォールバックする。LOOPED_STREAMING でピンの生成自体は成功しても
+        // WaveRT のバッファ/通知イベント取得(TryEnableWaveRt)に失敗する
+        // ことがあるため、その場合はこのピンを破棄して
+        // KSINTERFACE_STANDARD_STREAMING(素のストリーミング I/O)を試す。
         struct ConnectRequest {
             KSPIN_CONNECT connect;
             KSDATAFORMAT_WAVEFORMATEX format;
         };
 
-        auto tryCreate = [&](bool asFloat) -> bool {
+        auto tryCreate = [&](ULONG interfaceId, bool asFloat) -> bool {
             ConnectRequest req{};
             req.connect.Interface.Set = KSINTERFACESETID_Standard;
-            req.connect.Interface.Id = KSINTERFACE_STANDARD_STREAMING;
+            req.connect.Interface.Id = interfaceId;
             req.connect.Interface.Flags = 0;
             req.connect.Medium.Set = KSMEDIUMSETID_Standard;
             req.connect.Medium.Id = KSMEDIUM_STANDARD_DEVIO;
@@ -299,16 +305,110 @@ bool KsDevice::FindAndCreatePin(const DeviceStreamConfig& config, std::wstring* 
             sampleRate_ = config.sampleRate;
             formatIsFloat_ = asFloat;
             bitsPerSample_ = asFloat ? 32 : 16;
+
+            if (interfaceId == KSINTERFACE_STANDARD_LOOPED_STREAMING) {
+                std::wstring waveRtErr;
+                if (TryEnableWaveRt(desiredPeriodFrames, &waveRtErr)) return true;
+                // WaveRT ネゴシエーションに失敗。このピンは使わずフォールバックへ。
+                CloseHandle(pinHandle_);
+                pinHandle_ = INVALID_HANDLE_VALUE;
+                channels_ = 0;
+                return false;
+            }
             return true;
         };
 
-        found = tryCreate(true) || tryCreate(false);
+        found = tryCreate(KSINTERFACE_STANDARD_LOOPED_STREAMING, true) ||
+               tryCreate(KSINTERFACE_STANDARD_LOOPED_STREAMING, false) ||
+               tryCreate(KSINTERFACE_STANDARD_STREAMING, true) ||
+               tryCreate(KSINTERFACE_STANDARD_STREAMING, false);
     }
 
     if (!found) {
         if (errorOut) *errorOut = L"no matching KS pin found for requested format";
         return false;
     }
+    return true;
+}
+
+// ===========================================================================
+// gap 7: WaveRT のバッファ/通知イベント取得。pinHandle_ が
+// KSINTERFACE_STANDARD_LOOPED_STREAMING で生成できた直後にだけ呼ぶ
+// (呼び出し元は FindAndCreatePin::tryCreate)。
+// 参考にした実装: PortAudio の WDM-KS バックエンド
+// (src/hostapi/wdmks/pa_win_wdmks.c の PinGetBufferWithNotification /
+// PinRegisterNotificationHandle。構造体レイアウトは Windows SDK の
+// ksmedia.h と突き合わせ済み)。
+// ===========================================================================
+bool KsDevice::TryEnableWaveRt(UINT32 desiredPeriodFrames, std::wstring* errorOut) {
+    const int bytesPerSample = bitsPerSample_ / 8;
+    const ULONG frameBytes = (ULONG)(bytesPerSample * channels_);
+    // NotificationCount=2: バッファの半周・1周で通知が来る(実装ガイドの
+    // 循環バッファ 2 分割方式)。要求サイズは希望周期の 2 倍。
+    ULONG requestedBytes = (ULONG)desiredPeriodFrames * frameBytes * 2;
+    if (requestedBytes == 0) requestedBytes = frameBytes * 2;  // 0 要求を避ける保険
+
+    KSRTAUDIO_BUFFER_PROPERTY_WITH_NOTIFICATION propIn{};
+    propIn.Property.Set = KSPROPSETID_RtAudio;
+    propIn.Property.Id = KSPROPERTY_RTAUDIO_BUFFER_WITH_NOTIFICATION;
+    propIn.Property.Flags = KSPROPERTY_TYPE_GET;
+    propIn.BaseAddress = nullptr;
+    propIn.RequestedBufferSize = requestedBytes;
+    propIn.NotificationCount = 2;
+
+    KSRTAUDIO_BUFFER propOut{};
+    ULONG bytesReturned = 0;
+    if (!DeviceIoControl(pinHandle_, IOCTL_KS_PROPERTY, &propIn, sizeof(propIn), &propOut,
+                         sizeof(propOut), &bytesReturned, nullptr)) {
+        if (errorOut) *errorOut = L"KSPROPERTY_RTAUDIO_BUFFER_WITH_NOTIFICATION failed";
+        return false;
+    }
+    if (!propOut.BufferAddress || propOut.ActualBufferSize < frameBytes * 2) {
+        if (errorOut) *errorOut = L"WaveRT returned an unusable buffer";
+        return false;
+    }
+
+    HANDLE notifyEvent = CreateEventW(nullptr, /*bManualReset=*/FALSE, /*bInitialState=*/FALSE,
+                                      nullptr);
+    if (!notifyEvent) {
+        if (errorOut) *errorOut = L"CreateEvent(WaveRT notification) failed";
+        return false;
+    }
+
+    KSRTAUDIO_NOTIFICATION_EVENT_PROPERTY notifyProp{};
+    notifyProp.Property.Set = KSPROPSETID_RtAudio;
+    notifyProp.Property.Id = KSPROPERTY_RTAUDIO_REGISTER_NOTIFICATION_EVENT;
+    notifyProp.Property.Flags = KSPROPERTY_TYPE_SET;
+    notifyProp.NotificationEvent = notifyEvent;
+    if (!DeviceIoControl(pinHandle_, IOCTL_KS_PROPERTY, &notifyProp, sizeof(notifyProp),
+                         &notifyProp, sizeof(notifyProp), &bytesReturned, nullptr)) {
+        if (errorOut) *errorOut = L"KSPROPERTY_RTAUDIO_REGISTER_NOTIFICATION_EVENT failed";
+        CloseHandle(notifyEvent);
+        return false;
+    }
+
+    waveRtBuffer_ = propOut.BufferAddress;
+    waveRtBufferSize_ = propOut.ActualBufferSize;
+    waveRtCallMemoryBarrier_ = (propOut.CallMemoryBarrier != FALSE);
+    waveRtNotifyEvent_ = notifyEvent;
+    waveRtNextHalf_ = 0;
+
+    // 実際に確保された半周ぶんのフレーム数を正の周期として採用する
+    // (ドライバがハードウェア境界に合わせて RequestedBufferSize を
+    // 切り上げ/丸めることがあるため、要求値をそのまま信じない)。
+    periodFrames_ = (UINT32)((waveRtBufferSize_ / 2) / frameBytes);
+    if (periodFrames_ == 0) {
+        // 保険: 万一 0 になったら安全側に倒して無効化する
+        // (呼び出し元 tryCreate がこのピンを破棄してフォールバックする)。
+        if (errorOut) *errorOut = L"WaveRT buffer too small for even one frame";
+        CloseHandle(notifyEvent);
+        waveRtNotifyEvent_ = nullptr;
+        waveRtBuffer_ = nullptr;
+        waveRtBufferSize_ = 0;
+        return false;
+    }
+
+    waveRtActive_ = true;
     return true;
 }
 
@@ -353,17 +453,29 @@ bool KsDevice::Open(const DeviceStreamConfig& config, std::wstring* errorOut) {
     };
 
     if (!OpenFilter(errorOut)) return false;
-    if (!FindAndCreatePin(config, errorOut)) return fail(L"pin negotiation failed");
 
-    periodFrames_ =
+    // gap 7: WaveRT を試す場合に備え、希望ブロックサイズを先に確定させて
+    // FindAndCreatePin(→TryEnableWaveRt)に渡す。
+    const UINT32 desiredPeriodFrames =
         config.preferredBufferFrames > 0 ? (UINT32)config.preferredBufferFrames : 512;
+
+    if (!FindAndCreatePin(config, desiredPeriodFrames, errorOut))
+        return fail(L"pin negotiation failed");
+
+    // WaveRT が有効なら TryEnableWaveRt が periodFrames_ を実際の
+    // ActualBufferSize から確定済み。無効(フォールバック)なら希望値を使う。
+    if (!waveRtActive_) periodFrames_ = desiredPeriodFrames;
 
     stopEvent_ = CreateEventW(nullptr, TRUE, FALSE, nullptr);
     if (!stopEvent_) return fail(L"CreateEvent failed");
 
     const int bytesPerSample = bitsPerSample_ / 8;
     const size_t frameBytes = (size_t)bytesPerSample * channels_;
-    streamBuffer_.assign(sizeof(KSSTREAM_HEADER) + (size_t)periodFrames_ * frameBytes, 0);
+    if (!waveRtActive_) {
+        // WaveRT 経路はマップ済みバッファ(waveRtBuffer_)を直接使うため
+        // streamBuffer_(KSSTREAM_HEADER 用の中継バッファ)は不要。
+        streamBuffer_.assign(sizeof(KSSTREAM_HEADER) + (size_t)periodFrames_ * frameBytes, 0);
+    }
 
     rings_.clear();
     rings_.reserve((size_t)channels_);
@@ -397,6 +509,30 @@ void KsDevice::Stop() {
 
 void KsDevice::Close() {
     Stop();
+
+    // gap 7: WaveRT の通知イベント登録解除(ピンを閉じる前に行う)。
+    // マップ済みバッファ自体はピンハンドルの所有物で、明示 unmap の
+    // プロパティは無い(CloseHandle(pinHandle_) で自動的に解放される)。
+    if (waveRtActive_ && pinHandle_ != INVALID_HANDLE_VALUE && waveRtNotifyEvent_) {
+        KSRTAUDIO_NOTIFICATION_EVENT_PROPERTY notifyProp{};
+        notifyProp.Property.Set = KSPROPSETID_RtAudio;
+        notifyProp.Property.Id = KSPROPERTY_RTAUDIO_UNREGISTER_NOTIFICATION_EVENT;
+        notifyProp.Property.Flags = KSPROPERTY_TYPE_SET;
+        notifyProp.NotificationEvent = waveRtNotifyEvent_;
+        ULONG bytesReturned = 0;
+        DeviceIoControl(pinHandle_, IOCTL_KS_PROPERTY, &notifyProp, sizeof(notifyProp),
+                        &notifyProp, sizeof(notifyProp), &bytesReturned, nullptr);
+    }
+    if (waveRtNotifyEvent_) {
+        CloseHandle(waveRtNotifyEvent_);
+        waveRtNotifyEvent_ = nullptr;
+    }
+    waveRtBuffer_ = nullptr;
+    waveRtBufferSize_ = 0;
+    waveRtCallMemoryBarrier_ = false;
+    waveRtActive_ = false;
+    waveRtNextHalf_ = 0;
+
     if (pinHandle_ != INVALID_HANDLE_VALUE) {
         SetPinState(KSSTATE_STOP);
         CloseHandle(pinHandle_);
@@ -439,9 +575,29 @@ DeviceStatus KsDevice::Status() const {
 }
 
 // ===========================================================================
-// RT(専用スレッド)側: 素の KS ストリーミング I/O
+// RT(専用スレッド)側。gap 7: waveRtActive_ が true ならマップ済み循環
+// バッファ + 通知イベント(WaitForMultipleObjects でイベント駆動)、
+// そうでなければ従来どおり素の KS ストリーミング I/O(ポーリング + 同期
+// ReadFile/WriteFile)を使う。
 // ===========================================================================
 void KsDevice::ThreadMain() {
+    if (waveRtActive_) {
+        HANDLE waitHandles[2] = { stopEvent_, waveRtNotifyEvent_ };
+        while (running_.load(std::memory_order_relaxed)) {
+            DWORD wait = WaitForMultipleObjects(2, waitHandles, FALSE, INFINITE);
+            if (wait == WAIT_OBJECT_0) break;               // stopEvent_
+            if (wait != WAIT_OBJECT_0 + 1) continue;         // それ以外は無視して再待機
+
+            cbCount_.fetch_add(1, std::memory_order_relaxed);
+            if (isCapture_) {
+                ProcessOneWaveRtCapture();
+            } else {
+                ProcessOneWaveRtRender();
+            }
+        }
+        return;
+    }
+
     while (running_.load(std::memory_order_relaxed)) {
         if (WaitForSingleObject(stopEvent_, 0) == WAIT_OBJECT_0) break;
 
@@ -452,6 +608,87 @@ void KsDevice::ThreadMain() {
             ProcessOneRender();
         }
     }
+}
+
+// ===========================================================================
+// gap 7: WaveRT 経路。通知イベントが 1 回シグナルされるたびに、マップ済み
+// 循環バッファ(waveRtBuffer_、全体で periodFrames_ の 2 倍ぶん)のうち
+// waveRtNextHalf_ が指す半分(periodFrames_ フレームぶん)を処理し、次回に
+// 備えて半分のインデックスを反転させる。
+//
+// 既知の簡略化(ks_device.h 冒頭コメント参照): NotificationCount=2 の
+// 仕様(半周・1周で通知)どおり「通知のたびにちょうど半分」という前提で
+// 単純に 0/1 を交互に処理する。PortAudio の WaveRT バックエンドが行って
+// いるような、ハードウェア位置レジスタ(KSPROPERTY_RTAUDIO_POSITIONREGISTER)
+// に基づく実際の DMA 位置の追跡は行わない(通知のタイミングがずれた場合の
+// 頑健性はその分弱い。実機での追加検証が必要な将来課題)。
+// ===========================================================================
+void KsDevice::ProcessOneWaveRtCapture() {
+    const int bytesPerSample = bitsPerSample_ / 8;
+    const size_t frameBytes = (size_t)bytesPerSample * channels_;
+    const size_t halfBytes = (size_t)periodFrames_ * frameBytes;
+
+    if (waveRtCallMemoryBarrier_) MemoryBarrier();
+
+    const uint8_t* data =
+        static_cast<const uint8_t*>(waveRtBuffer_) + (size_t)waveRtNextHalf_ * halfBytes;
+    waveRtNextHalf_ ^= 1;
+
+    // インターリーブ → プレーナ(ProcessOneCapture と同じ変換方針)
+    for (int c = 0; c < channels_; ++c) {
+        float* scratch = channelScratch_.data() + (size_t)c * periodFrames_;
+        for (UINT32 f = 0; f < periodFrames_; ++f) {
+            const uint8_t* p = data + (size_t)f * frameBytes + (size_t)c * bytesPerSample;
+            float v;
+            if (formatIsFloat_) {
+                std::memcpy(&v, p, 4);
+            } else {
+                int16_t s;
+                std::memcpy(&s, p, 2);
+                v = s / 32768.0f;
+            }
+            scratch[f] = v;
+        }
+        size_t written = rings_[(size_t)c]->Write(scratch, periodFrames_);
+        if (written < periodFrames_) overrunCount_.fetch_add(1, std::memory_order_relaxed);
+    }
+
+    if (blockCallback_) blockCallback_((int)periodFrames_);
+}
+
+void KsDevice::ProcessOneWaveRtRender() {
+    const int bytesPerSample = bitsPerSample_ / 8;
+    const size_t frameBytes = (size_t)bytesPerSample * channels_;
+    const size_t halfBytes = (size_t)periodFrames_ * frameBytes;
+
+    // エンジンにブロック境界を通知し、RenderRing へ新しいデータを
+    // 書き込ませてから(ProcessOneRender と同じ順序)、実際にマップ済み
+    // バッファへ書き出す。
+    if (blockCallback_) blockCallback_((int)periodFrames_);
+
+    uint8_t* data = static_cast<uint8_t*>(waveRtBuffer_) + (size_t)waveRtNextHalf_ * halfBytes;
+    waveRtNextHalf_ ^= 1;
+
+    for (int c = 0; c < channels_; ++c) {
+        float* scratch = channelScratch_.data() + (size_t)c * periodFrames_;
+        size_t got = rings_[(size_t)c]->Read(scratch, periodFrames_);
+        if (got < periodFrames_) {
+            underrunCount_.fetch_add(1, std::memory_order_relaxed);
+            std::fill(scratch + got, scratch + periodFrames_, 0.0f);
+        }
+        for (UINT32 f = 0; f < periodFrames_; ++f) {
+            uint8_t* p = data + (size_t)f * frameBytes + (size_t)c * bytesPerSample;
+            if (formatIsFloat_) {
+                std::memcpy(p, &scratch[f], 4);
+            } else {
+                float v = scratch[f] > 1.0f ? 1.0f : (scratch[f] < -1.0f ? -1.0f : scratch[f]);
+                int16_t s = (int16_t)(v * 32767.0f);
+                std::memcpy(p, &s, 2);
+            }
+        }
+    }
+
+    if (waveRtCallMemoryBarrier_) MemoryBarrier();
 }
 
 void KsDevice::ProcessOneCapture() {

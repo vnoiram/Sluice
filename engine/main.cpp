@@ -32,12 +32,12 @@
 //   - デバイス構成はプロセス起動時の CLI 引数で固定する。実行中にデバイスを
 //     新規追加/差し替えする IPC は無い(add_strip/remove_strip は「既に
 //     開いているデバイスのチャンネル」に対するストリップの増減のみ)。
-//   - マスタークロック以外の出力デバイスはドリフト補正されない
-//     (InputBoundary/ASRC は入力側にしか無い)。複数の出力デバイスを使う
-//     構成では、マスター以外の出力デバイスのクロックがずれると長時間で
-//     xrun しうる。対称な「出力バウンダリ」の実装は将来課題(vasio ブリッジは
-//     マスターに従属する設計上そもそも独立クロックを持たないため、この
-//     制約の対象外)。
+//   - マスタークロック以外の出力デバイスも OutputBoundary/AsrcWriter
+//     (graph/engine_graph.h, graph/bus.h, dsp/drift.h)によりドリフト補正
+//     される(InputBoundary/AsrcReader の入力側実装と対称)。マスター自身の
+//     出力は callback がブロック境界そのものなので ASRC を適用しない
+//     (vasio ブリッジはマスターに従属する設計上そもそも独立クロックを
+//     持たないため、この対象にもならない)。
 //   - EQ/ゲート/コンプ/リミッタの set_param 経由での調整は対応しているが、
 //     どの値が「良い」かは呼び出し側の責務(バリデーションは最小限)。
 
@@ -46,8 +46,10 @@
 #include <algorithm>
 #include <atomic>
 #include <cstdio>
+#include <fstream>
 #include <memory>
 #include <mutex>
+#include <sstream>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -64,6 +66,7 @@
 #include "graph/engine_graph.h"
 #include "graph/master_clock.h"
 #include "ipc/device_report.h"
+#include "ipc/latency_db.h"
 #include "ipc/pipe_server.h"
 #include "rt/rt_alloc_guard.h"
 #include "version.h"
@@ -90,6 +93,56 @@ std::wstring Utf8ToWide(const std::string& s) {
     std::wstring out((size_t)len, L'\0');
     MultiByteToWideChar(CP_UTF8, 0, s.data(), (int)s.size(), out.data(), len);
     return out;
+}
+
+// --- gap 8: tools/latencybench --json の結果を DeviceCaps.measuredLatencyMs
+//     へ反映する ---------------------------------------------------------------
+// 起動時に一度だけ読み込み、以後は BuildDevicesJson/ListDevices からの
+// ルックアップだけを行う(実測値ファイルの再読込・ホットリロードは無し。
+// 手動で latencybench を再実行してエンジンを再起動する運用を想定)。
+std::vector<ipc::LatencyMeasurement> g_latencyDb;
+
+// 実行ファイルと同じディレクトリの latencybench-results.json を既定パスとする
+// (latencybench.exe --json <path> の出力をそのまま指せるよう、明示パスは
+// --latency-db で上書きできる)。見つからなければ静かに空のまま(測定値
+// 無しは既存の「未測定=0.0」動作と等価)。
+std::wstring DefaultLatencyDbPath() {
+    wchar_t exePath[MAX_PATH] = {};
+    const DWORD len = GetModuleFileNameW(nullptr, exePath, MAX_PATH);
+    if (len == 0 || len >= MAX_PATH) return L"";
+    std::wstring path(exePath, len);
+    const size_t slash = path.find_last_of(L"\\/");
+    if (slash == std::wstring::npos) return L"";
+    return path.substr(0, slash + 1) + L"latencybench-results.json";
+}
+
+// ListDevices() の表示行に付け足す " measured=X.XXms" 断片(未測定なら空文字)。
+std::wstring FormatMeasuredLatencySuffix(double measuredLatencyMs) {
+    if (measuredLatencyMs <= 0.0) return L"";
+    wchar_t buf[48];
+    swprintf(buf, 48, L", measured=%.2fms", measuredLatencyMs);
+    return buf;
+}
+
+void LoadLatencyDb(const std::wstring& explicitPath) {
+    const std::wstring path = explicitPath.empty() ? DefaultLatencyDbPath() : explicitPath;
+    if (path.empty()) return;
+    // 中身は UTF-8 のテキスト(tools/latencybench --json が素の std::ofstream で
+    // バイト列として書き出したもの)なので、ワイド文字ストリームは使わず
+    // バイト列のまま読む(std::ifstream の wstring パス受け取りは csvPath と
+    // 同じ MSVC 拡張)。JsonValue::Parse は UTF-8 std::string をそのまま扱える。
+    std::ifstream in(path, std::ios::binary);
+    if (!in.is_open()) return;
+    std::ostringstream buf;
+    buf << in.rdbuf();
+    const std::string text = buf.str();
+    try {
+        JsonValue root = JsonValue::Parse(text);
+        g_latencyDb = ipc::ParseLatencyDb(root);
+        wprintf(L"loaded %zu latency measurement(s) from %s\n", g_latencyDb.size(), path.c_str());
+    } catch (const std::exception&) {
+        // 壊れた/古い形式のファイルは無視する(実測値無し運用にフォールバック)。
+    }
 }
 
 // ===========================================================================
@@ -137,16 +190,25 @@ struct StripSpec {
     int channel = -1;
     StripParams params;
 };
+// OutputBoundarySpec: BoundarySpec と対称。非マスターのレンダーデバイス
+// 1 台につき 1 つ(実装ガイド §5.1 の考え方を出力側に適用したもの、
+// graph/engine_graph.h の OutputBoundary 参照)。マスターデバイスの出力は
+// ここに含めない(ASRC を適用しない)。
+struct OutputBoundarySpec {
+    int deviceIndex = -1;  // devices_ 内のレンダーデバイスの index
+};
 struct BusSpec {
     int deviceIndex = -1;  // devices_ 内のレンダーデバイスの index
     int channel = -1;
     BusParams params;
+    int outputBoundaryIndex = -1;  // -1 = マスターバス(ASRC 無し)
 };
 
 struct MixerState {
     std::vector<DeviceEntry> devices;
     std::vector<BoundarySpec> boundaries;
     std::vector<StripSpec> strips;
+    std::vector<OutputBoundarySpec> outputBoundaries;
     std::vector<BusSpec> buses;
 
     std::unique_ptr<GraphHandle> graphHandle;
@@ -170,6 +232,11 @@ void RebuildEngineGraph(MixerState& st) {
     for (const auto& b : st.boundaries)
         boundaries.emplace_back(*st.devices[(size_t)b.deviceIndex].device->CaptureRing(0));
 
+    std::vector<OutputBoundary> outputBoundaries;
+    outputBoundaries.reserve(st.outputBoundaries.size());
+    for (const auto& ob : st.outputBoundaries)
+        outputBoundaries.emplace_back(*st.devices[(size_t)ob.deviceIndex].device->RenderRing(0));
+
     std::vector<StripRuntime> strips;
     strips.reserve(st.strips.size());
     for (const auto& s : st.strips) {
@@ -185,11 +252,13 @@ void RebuildEngineGraph(MixerState& st) {
     for (const auto& b : st.buses) {
         DeviceEntry& entry = st.devices[(size_t)b.deviceIndex];
         std::vector<SpscRing<float>*> outputs{entry.device->RenderRing(b.channel)};
-        buses.emplace_back(st.maxBlockFrames, std::move(outputs), b.params);
+        const Lane lane = entry.device->Status().lane;
+        buses.emplace_back(st.maxBlockFrames, std::move(outputs), b.params,
+                           b.outputBoundaryIndex, lane);
     }
 
     auto newGraph = std::make_unique<EngineGraph>(std::move(boundaries), std::move(strips),
-                                                   std::move(buses));
+                                                   std::move(buses), std::move(outputBoundaries));
     EngineGraph* raw = newGraph.get();
     if (!st.graphHandle) st.graphHandle = std::make_unique<GraphHandle>();
     st.graphHandle->Publish(std::move(newGraph));
@@ -321,33 +390,6 @@ std::unique_ptr<MixerState> OpenAndBuild(const std::vector<DeviceSpec>& specs,
         }
     }
 
-    // バス: (レンダー方向を持つデバイス, チャンネル) の組ごとに 1 つ
-    // (ストリップと対称)。
-    for (size_t di = 0; di < st->devices.size(); ++di) {
-        IAudioDevice* dev = st->devices[di].device.get();
-        const int channels = ProbeChannelCount(dev, /*isCapture=*/false);
-        for (int ch = 0; ch < channels; ++ch) {
-            BusSpec b;
-            b.deviceIndex = (int)di;
-            b.channel = ch;
-            st->buses.push_back(b);
-        }
-    }
-
-    if (st->buses.empty()) {
-        *errorOut = L"no output (render) devices configured";
-        for (auto& e : st->devices) e.device->Close();
-        return nullptr;
-    }
-
-    // --auto-route: 全ストリップを全バスへ 0dB で送る(実装ガイド既定の
-    // 「全ルーティングgainはミュート」を上書きする、お試し用の便宜フラグ)。
-    if (autoRoute) {
-        for (auto& s : st->strips)
-            for (size_t bi = 0; bi < st->buses.size() && bi < StripParams::kMaxBuses; ++bi)
-                s.params.routingGain[bi] = 0.0f;
-    }
-
     // マスタークロック選定(実装ガイド §2.3): RT Lane のデバイスから選ぶ。
     // 出力デバイスを優先する(§5.4.1 の「マスターコールバック」は本来
     // RenderRing 読み出し直前に発火するもので、出力側が自然)。vasio ブリッジ
@@ -355,6 +397,8 @@ std::unique_ptr<MixerState> OpenAndBuild(const std::vector<DeviceSpec>& specs,
     // クロックを持たず「エンジンのマスタークロックに従属する」設計
     // (実装ガイド §8.1 手順4)なので、それ自身をマスターに選ぶと駆動元が
     // 無くなり循環する。
+    // (バスの構築より前に選ぶ必要がある: マスター以外のレンダーデバイスに
+    // だけ OutputBoundarySpec を割り当てるため。)
     std::vector<IAudioDevice*> allPtrs;
     allPtrs.reserve(st->devices.size());
     for (auto& e : st->devices) {
@@ -381,6 +425,44 @@ std::unique_ptr<MixerState> OpenAndBuild(const std::vector<DeviceSpec>& specs,
         *errorOut = L"no non-vasio devices available to act as master clock";
         for (auto& e : st->devices) e.device->Close();
         return nullptr;
+    }
+
+    // バス: (レンダー方向を持つデバイス, チャンネル) の組ごとに 1 つ
+    // (ストリップと対称)。マスター以外のレンダーデバイスは、デバイス
+    // 1 台につき 1 つの OutputBoundarySpec を割り当てる(非マスター出力側
+    // の ASRC/ドリフト補正、実装ガイド §5.1 の考え方を出力側にも適用)。
+    for (size_t di = 0; di < st->devices.size(); ++di) {
+        IAudioDevice* dev = st->devices[di].device.get();
+        const int channels = ProbeChannelCount(dev, /*isCapture=*/false);
+        if (channels <= 0) continue;
+        int outputBoundaryIndex = -1;
+        if (dev != master) {
+            OutputBoundarySpec ob;
+            ob.deviceIndex = (int)di;
+            outputBoundaryIndex = (int)st->outputBoundaries.size();
+            st->outputBoundaries.push_back(ob);
+        }
+        for (int ch = 0; ch < channels; ++ch) {
+            BusSpec b;
+            b.deviceIndex = (int)di;
+            b.channel = ch;
+            b.outputBoundaryIndex = outputBoundaryIndex;
+            st->buses.push_back(b);
+        }
+    }
+
+    if (st->buses.empty()) {
+        *errorOut = L"no output (render) devices configured";
+        for (auto& e : st->devices) e.device->Close();
+        return nullptr;
+    }
+
+    // --auto-route: 全ストリップを全バスへ 0dB で送る(実装ガイド既定の
+    // 「全ルーティングgainはミュート」を上書きする、お試し用の便宜フラグ)。
+    if (autoRoute) {
+        for (auto& s : st->strips)
+            for (size_t bi = 0; bi < st->buses.size() && bi < StripParams::kMaxBuses; ++bi)
+                s.params.routingGain[bi] = 0.0f;
     }
 
     const long masterBuf = master->Status().bufferSizeFrames;
@@ -509,7 +591,10 @@ JsonValue BuildDevicesJson(const MixerState& st) {
     for (size_t i = 0; i < st.devices.size(); ++i) {
         const DeviceEntry& e = st.devices[i];
         const DeviceStatus status = e.device->Status();
-        const DeviceCaps caps = e.device->Probe(kSampleRate);
+        DeviceCaps caps = e.device->Probe(kSampleRate);
+        // gap 8: tools/latencybench --json の実測値があれば反映する
+        // (Probe() 自体は各バックエンドとも常に未測定=0.0 のまま)。
+        caps.measuredLatencyMs = ipc::LookupMeasuredLatencyMs(g_latencyDb, e.name);
         const bool isMaster = (e.device.get() == st.masterDevice);
 
         // 片方向デバイス(ASIO/WASAPI/KS/プロセスループバック)はどちらか
@@ -535,12 +620,22 @@ JsonValue BuildDevicesJson(const MixerState& st) {
             reports.push_back(report);
         }
         if (hasRender) {
-            // レンダー方向には ASRC が無いので既定 1.0(main.cpp 冒頭コメントの
-            // 既知の簡略化を参照)。
+            // マスターデバイスの出力には ASRC が無い(bus.h の
+            // outputBoundaryIndex == -1)ので 1.0 のまま。それ以外は
+            // OutputBoundary の直近比を参照する(キャプチャ方向の
+            // BoundaryRatioForUi と対称)。
+            double ratio = 1.0;
+            if (st.controlGraph) {
+                for (size_t obi = 0; obi < st.outputBoundaries.size(); ++obi) {
+                    if (st.outputBoundaries[obi].deviceIndex == (int)i) {
+                        ratio = st.controlGraph->OutputBoundaryRatioForUi(obi);
+                        break;
+                    }
+                }
+            }
             const std::string id = e.backend + ":out:" + std::to_string(i);
             JsonValue report = ipc::DeviceReportToJson(id, e.name, e.backend.c_str(),
-                                                       /*isCapture=*/false, status, caps,
-                                                       /*asrcRatio=*/1.0);
+                                                       /*isCapture=*/false, status, caps, ratio);
             report["isMasterClock"] = isMaster;
             reports.push_back(report);
         }
@@ -609,30 +704,39 @@ void ListDevices() {
     auto asioDrivers = asiohost::EnumerateDrivers();
     for (size_t i = 0; i < asioDrivers.size(); ++i) {
         asiohost::AsioDevice probe(asioDrivers[i], /*isInput=*/true);
-        const DeviceCaps caps = probe.Probe(kSampleRate);
-        wprintf(L"  [%zu] %s  (supports64=%s, lane=%s)\n", i, asioDrivers[i].name.c_str(),
+        DeviceCaps caps = probe.Probe(kSampleRate);
+        caps.measuredLatencyMs =
+            ipc::LookupMeasuredLatencyMs(g_latencyDb, WideToUtf8(asioDrivers[i].name));
+        wprintf(L"  [%zu] %s  (supports64=%s, lane=%s%s)\n", i, asioDrivers[i].name.c_str(),
                 caps.supports64 ? L"yes" : L"no",
-                caps.recommendedLane == Lane::RT ? L"RT" : L"Compat");
+                caps.recommendedLane == Lane::RT ? L"RT" : L"Compat",
+                FormatMeasuredLatencySuffix(caps.measuredLatencyMs).c_str());
     }
 
     wprintf(L"\nWASAPI capture endpoints (--wasapi-in <idx>):\n");
     auto wasapiIn = wasapi::EnumerateEndpoints(/*isCapture=*/true);
     for (size_t i = 0; i < wasapiIn.size(); ++i) {
         wasapi::WasapiDevice probe(wasapiIn[i].id, /*isCapture=*/true);
-        const DeviceCaps caps = probe.Probe(kSampleRate);
-        wprintf(L"  [%zu] %s  (supports64=%s, lane=%s)\n", i, wasapiIn[i].name.c_str(),
+        DeviceCaps caps = probe.Probe(kSampleRate);
+        caps.measuredLatencyMs =
+            ipc::LookupMeasuredLatencyMs(g_latencyDb, WideToUtf8(wasapiIn[i].name));
+        wprintf(L"  [%zu] %s  (supports64=%s, lane=%s%s)\n", i, wasapiIn[i].name.c_str(),
                 caps.supports64 ? L"yes" : L"no",
-                caps.recommendedLane == Lane::RT ? L"RT" : L"Compat");
+                caps.recommendedLane == Lane::RT ? L"RT" : L"Compat",
+                FormatMeasuredLatencySuffix(caps.measuredLatencyMs).c_str());
     }
 
     wprintf(L"\nWASAPI render endpoints (--wasapi-out <idx>):\n");
     auto wasapiOut = wasapi::EnumerateEndpoints(/*isCapture=*/false);
     for (size_t i = 0; i < wasapiOut.size(); ++i) {
         wasapi::WasapiDevice probe(wasapiOut[i].id, /*isCapture=*/false);
-        const DeviceCaps caps = probe.Probe(kSampleRate);
-        wprintf(L"  [%zu] %s  (supports64=%s, lane=%s)\n", i, wasapiOut[i].name.c_str(),
+        DeviceCaps caps = probe.Probe(kSampleRate);
+        caps.measuredLatencyMs =
+            ipc::LookupMeasuredLatencyMs(g_latencyDb, WideToUtf8(wasapiOut[i].name));
+        wprintf(L"  [%zu] %s  (supports64=%s, lane=%s%s)\n", i, wasapiOut[i].name.c_str(),
                 caps.supports64 ? L"yes" : L"no",
-                caps.recommendedLane == Lane::RT ? L"RT" : L"Compat");
+                caps.recommendedLane == Lane::RT ? L"RT" : L"Compat",
+                FormatMeasuredLatencySuffix(caps.measuredLatencyMs).c_str());
     }
 
     wprintf(L"\nKS devices (--ks-in/--ks-out <idx>, direction determined by pin discovery):\n");
@@ -668,6 +772,7 @@ int wmain(int argc, wchar_t** argv) {
     bool lowLatency = false;
     bool autoRoute = false;
     int reqChannels = 2;
+    std::wstring latencyDbPath;  // gap 8: 既定は実行ファイル隣接の latencybench-results.json
 
     auto nextInt = [&](int i, int def) -> int {
         return (i + 1 < argc) ? _wtoi(argv[i + 1]) : def;
@@ -683,6 +788,11 @@ int wmain(int argc, wchar_t** argv) {
             autoRoute = true;
         } else if (a == L"--channels") {
             reqChannels = nextInt(i, reqChannels);
+            ++i;
+        } else if (a == L"--latency-db") {
+            // gap 8: tools/latencybench --json の出力パスを明示指定する
+            // (省略時は実行ファイル隣接の latencybench-results.json を試す)。
+            latencyDbPath = (i + 1 < argc) ? argv[i + 1] : L"";
             ++i;
         } else if (a == L"--asio-in" || a == L"--asio-out") {
             DeviceSpec s;
@@ -767,6 +877,8 @@ int wmain(int argc, wchar_t** argv) {
             return 1;
         }
     }
+
+    LoadLatencyDb(latencyDbPath);
 
     if (FAILED(CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED))) {
         fwprintf(stderr, L"CoInitializeEx failed\n");
@@ -942,6 +1054,7 @@ int wmain(int argc, wchar_t** argv) {
 
         if (anyReset) {
             wprintf(L"** device reset requested: rebuilding pipeline **\n");
+            const int oldMaxBlockFrames = state->maxBlockFrames;
             StopAndCloseAll(*state);
             std::wstring rebuildErr;
             auto next = OpenAndBuild(specs, baseConfig, autoRoute, &rebuildErr);
@@ -949,6 +1062,13 @@ int wmain(int argc, wchar_t** argv) {
                 state = std::move(next);
                 wprintf(L"rebuilt:\n");
                 PrintStats(*state);
+                // 実装ガイド §8.1 手順6: マスタークロックのブロックサイズが
+                // 変わった(≒ vasio ブリッジ経由の DAW から見えるバッファ
+                // サイズが変わった)場合、接続中の vasio ブリッジに DAW 側
+                // リセットを要求する(vasio.dll が次回 bufferSwitch の前に
+                // kAsioResetRequest を送出する、vasio/vasio_driver.cpp 参照)。
+                if (state->maxBlockFrames != oldMaxBlockFrames)
+                    for (auto* bridge : state->vasioBridges) bridge->RequestDawReset();
             } else {
                 fwprintf(stderr, L"rebuild failed: %s (will retry)\n", rebuildErr.c_str());
                 state = std::make_unique<MixerState>();  // IPC が壊れず空を返せるように

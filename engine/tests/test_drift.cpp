@@ -238,6 +238,120 @@ void RunScenario(const Scenario& sc) {
                 lastRatio);
 }
 
+// ---------------------------------------------------------------------------
+// 出力側(AsrcWriter/OutputBoundary 相当)の収束テスト。RunScenario と対称:
+// 「エンジン(固定レートでブロックを生成する側)」が AsrcWriter で書き込み、
+// 「実クロックがドリフトした出力デバイス」が FakeProducer(ここでは
+// 消費側として再利用)の駆動でリングから読み出す。
+// ---------------------------------------------------------------------------
+void RunOutputScenario(const Scenario& sc) {
+    constexpr int kBlockFrames = 256;
+    constexpr double kSimSeconds = 1800.0;
+    constexpr double kWarmupSeconds = 600.0;
+
+    const size_t frames = (size_t)kBlockFrames * 16;
+    size_t cap = 1;
+    while (cap < frames) cap <<= 1;
+
+    SpscRing<float> ring(cap);
+    AsrcWriter writer(ring, kBlockFrames);
+    DriftController drift;
+    Ema fillEma(0.99);
+
+    // 消費側(実出力デバイス)がドリフトしたクロックでリングから読み出す。
+    FakeProducer consumer(sc.driftPpm, kBlockFrames, /*jitterHoldbackProb=*/0.1,
+                          /*seed=*/(uint32_t)(2000 + sc.driftPpm));
+
+    std::vector<float> inScratch((size_t)kBlockFrames, 0.0f);
+    std::vector<float> outScratch((size_t)kBlockFrames, 0.0f);
+
+    const double dt = (double)kBlockFrames / 48000.0;  // エンジン(生産側)の1ブロック時間
+    const long long totalIters = (long long)(kSimSeconds / dt);
+    const long long warmupIters = (long long)(kWarmupSeconds / dt);
+
+    long long overrunAfterWarmup = 0;
+    long long underrunAfterWarmup = 0;
+    long long firstOverrunIter = -1;
+    double fillMinTail = 1.0, fillMaxTail = 0.0, fillSumTail = 0.0;
+    long long tailSamples = 0;
+    double lastRatio = 1.0;
+
+    for (long long it = 0; it < totalIters; ++it) {
+        // --- エンジン側 RT 相当: 固定ブロックを AsrcWriter でリングへ書く ---
+        RtGuard g;
+        const double fill = fillEma.Push(ring.FillRatio());
+        const double driftRatio = drift.Update(fill);
+        const double srcRatio = 1.0 / driftRatio;
+        lastRatio = driftRatio;
+
+        bool overrun = writer.Write(inScratch.data(), kBlockFrames, srcRatio);
+        if (overrun) {
+            if (firstOverrunIter < 0) firstOverrunIter = it;
+            if (it >= warmupIters) ++overrunAfterWarmup;
+        }
+
+        if (it >= warmupIters) {
+            fillMinTail = std::min(fillMinTail, fill);
+            fillMaxTail = std::max(fillMaxTail, fill);
+            fillSumTail += fill;
+            ++tailSamples;
+        }
+
+        // --- 出力デバイス側 RT 相当: ドリフトしたクロックでリングから読む ---
+        consumer.Advance(dt, [&](int n) {
+            size_t nFloats = (size_t)n;
+            if (ring.Read(outScratch.data(), nFloats) < nFloats) {
+                if (it >= warmupIters) ++underrunAfterWarmup;
+            }
+        });
+    }
+
+    char label[64];
+    std::snprintf(label, sizeof(label), "output driftPpm=%.0f", sc.driftPpm);
+
+    if (sc.expectZeroXrunAfterWarmup && overrunAfterWarmup != 0) {
+        Fail(std::string(label) + ": output ring write overrun observed after warmup "
+             "(count=" + std::to_string(overrunAfterWarmup) +
+             ", first at iter=" + std::to_string(firstOverrunIter) + " of " +
+             std::to_string(totalIters) + ", warmupIters=" +
+             std::to_string(warmupIters) + ")");
+    }
+    if (sc.expectZeroXrunAfterWarmup && underrunAfterWarmup != 0) {
+        Fail(std::string(label) + ": consumer underrun after warmup = " +
+             std::to_string(underrunAfterWarmup) + " (expected 0)");
+    }
+
+    if (tailSamples == 0) Fail(std::string(label) + ": no samples collected after warmup");
+    const double fillAvgTail = fillSumTail / (double)tailSamples;
+
+    if (sc.expectZeroXrunAfterWarmup) {
+        if (std::fabs(fillAvgTail - 0.5) > 0.05) {
+            Fail(std::string(label) + ": converged fill average out of band: " +
+                 std::to_string(fillAvgTail));
+        }
+        // 入力側(RunScenario)と違い、こちらは消費側(出力デバイス)が
+        // FakeProducer の holdback ジッタでバースト的に読み出す(AsrcReader
+        // 内部の stage バッファのような平滑化層が消費側に無い、実機の
+        // デバイスコールバックと同じ挙動)。そのぶん瞬間的な充填率の振れ幅は
+        // 入力側より大きくなるのが正常(xrun 0・平均収束は上のチェックで
+        // 別途保証済み)なので、帯域はオーバーラン/アンダーランに実際に
+        // 近づいていないことだけを確認する緩いものにする。
+        if (fillMinTail < 0.05 || fillMaxTail > 0.95) {
+            Fail(std::string(label) + ": fill ratio excursion too large "
+                                       "(min=" + std::to_string(fillMinTail) +
+                 " max=" + std::to_string(fillMaxTail) + ")");
+        }
+    }
+    if (fillMinTail < 0.0 || fillMaxTail > 1.0) {
+        Fail(std::string(label) + ": fill ratio left [0,1] range");
+    }
+
+    std::printf("PASS: %s  overrun_after_warmup=%lld  underrun_after_warmup=%lld  "
+                "fill_avg=%.4f  fill_range=[%.4f,%.4f]  ratio=%.7f\n",
+                label, overrunAfterWarmup, underrunAfterWarmup, fillAvgTail, fillMinTail,
+                fillMaxTail, lastRatio);
+}
+
 }  // namespace
 
 int main() {
@@ -255,6 +369,17 @@ int main() {
         RunScenario(sc);
         if (g_rtAllocViolations.load() != 0) {
             Fail("allocation occurred inside RT region during driftPpm=" +
+                 std::to_string(sc.driftPpm));
+        }
+    }
+
+    // 非マスター出力側(AsrcWriter/OutputBoundary、実装ガイド §5.1 の
+    // 考え方を出力側に適用したもの)も同じ収束特性を満たすことを確認する。
+    for (const auto& sc : scenarios) {
+        g_rtAllocViolations.store(0);
+        RunOutputScenario(sc);
+        if (g_rtAllocViolations.load() != 0) {
+            Fail("allocation occurred inside RT region during output driftPpm=" +
                  std::to_string(sc.driftPpm));
         }
     }

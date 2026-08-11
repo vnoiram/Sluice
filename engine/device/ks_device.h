@@ -12,16 +12,22 @@
 //   - `KSPROPERTY_PIN_PROPOSEDATAFORMAT` はピンの `KSPROPERTY_PIN_DATARANGES`
 //     が対応を謳っているフォーマットでも拒否されることがある。提案が通る
 //     フォーマットを見つけるまで複数候補を試す前提で書く。
-//   - 本実装は WaveRT(`KSPROPERTY_RTAUDIO_BUFFER_WITH_NOTIFICATION` による
-//     循環バッファの直接マップ)ではなく、素の KS ストリーミング I/O
-//     (`ReadFile`/`WriteFile` + `KSSTREAM_HEADER`)を使う。理由は実装ガイド
-//     §6.1 が「WaveRT 対応なら」と条件付きで言及している通り WaveRT は
-//     デバイス依存の追加対応であり、素のストリーミング I/O は KS ピンを
-//     持つ実質すべてのオーディオデバイスで動く共通の最小分母だから
-//     (ASIO4ALL/ASIO2KS が使う手法も同種、実装ガイド §6.2)。WaveRT への
-//     対応は測定に基づいて優先度を判断する将来課題(§7.3 の
-//     tools/latencybench で 64/128/256/512 サンプルでの実効レイテンシを
-//     測ってから、必要なら追加する)。
+//   - gap 5/7: WaveRT(`KSPROPERTY_RTAUDIO_BUFFER_WITH_NOTIFICATION` による
+//     循環バッファの直接マップ)に対応した。ピン生成時に
+//     `KSINTERFACE_STANDARD_LOOPED_STREAMING` を先に試し、成功かつ
+//     WaveRT のバッファ/通知イベント取得(下記 TryEnableWaveRt)にも
+//     成功した場合だけ使う。どちらかが失敗したら、そのピンは破棄して
+//     従来どおり `KSINTERFACE_STANDARD_STREAMING` +
+//     `ReadFile`/`WriteFile` + `KSSTREAM_HEADER` にフォールバックする
+//     (素のストリーミング I/O は KS ピンを持つ実質すべてのオーディオ
+//     デバイスで動く共通の最小分母、実装ガイド §6.2)。
+//     参考にした実装: PortAudio の WDM-KS バックエンド
+//     (src/hostapi/wdmks/pa_win_wdmks.c)。本実装は同ファイルの
+//     "WaveRT Event" サブモード相当(NotificationCount=2 の仕様どおり、
+//     通知のたびにバッファの半分ぶんちょうど処理する簡略版)で、
+//     PortAudio がさらに行っているハードウェア位置レジスタに基づく
+//     厳密な追跡("WaveRT Polled" 相当)は実装していない
+//     (実機での追加検証が必要な将来課題として残す)。
 //   - `KSPROPERTY_CONNECTION_STATE` は KSSTATE_STOP → ACQUIRE → PAUSE → RUN
 //     の順で 1 段階ずつ遷移させる必要がある(いきなり RUN にはできない)。
 //     停止時も RUN → PAUSE → ACQUIRE → STOP の順で戻す。
@@ -89,13 +95,31 @@ public:
 private:
     // --- ピン探索・生成(実装ガイド §6.1 手順1〜4) ----------------------
     bool OpenFilter(std::wstring* errorOut);
-    bool FindAndCreatePin(const DeviceStreamConfig& config, std::wstring* errorOut);
+    // desiredPeriodFrames: gap 7 の WaveRT 経路が要求バッファサイズ
+    // (周期の2倍、TryEnableWaveRt 参照)を組み立てるのに使う希望値。
+    // WaveRT が無効な場合は Open() 側が periodFrames_ に直接使う。
+    bool FindAndCreatePin(const DeviceStreamConfig& config, UINT32 desiredPeriodFrames,
+                          std::wstring* errorOut);
     bool SetPinState(ULONG state);  // KSSTATE_STOP/ACQUIRE/PAUSE/RUN へ1段階ずつ遷移
+
+    // gap 7: pinHandle_ が KSINTERFACE_STANDARD_LOOPED_STREAMING で生成
+    // できた直後にだけ呼ぶ。KSPROPERTY_RTAUDIO_BUFFER_WITH_NOTIFICATION で
+    // 循環バッファを取得し、KSPROPERTY_RTAUDIO_REGISTER_NOTIFICATION_EVENT
+    // で通知イベントを登録する。要求バッファは periodFrames_ の 2 倍
+    // (NotificationCount=2: 半周・1周で通知が来る)。失敗したら
+    // waveRt*_ 系メンバは初期状態のまま false/nullptr で返る
+    // (呼び出し側がこのピンを破棄してフォールバックする)。
+    bool TryEnableWaveRt(UINT32 desiredPeriodFrames, std::wstring* errorOut);
 
     // --- RT(専用スレッド)側 ---------------------------------------------
     void ThreadMain();
     void ProcessOneCapture();
     void ProcessOneRender();
+    // gap 7: WaveRT 経路(waveRtActive_ == true のときだけ使う)。
+    // 通知イベントが 1 回シグナルされるたびに、マップ済み循環バッファの
+    // 半分ぶん(periodFrames_ フレーム)を処理する。
+    void ProcessOneWaveRtCapture();
+    void ProcessOneWaveRtRender();
 
     KsDeviceInfo info_;
     bool isCapture_;
@@ -118,6 +142,18 @@ private:
     std::thread thread_;
     std::atomic<bool> running_{false};
     HANDLE stopEvent_ = nullptr;
+
+    // gap 7: WaveRT 経路。waveRtActive_ が true の間、ThreadMain は
+    // ReadFile/WriteFile ではなく waveRtNotifyEvent_ を待ってマップ済み
+    // バッファを直接読み書きする(rtwq_worker.h とは無関係。KS は現状
+    // 素の std::thread のまま、gap 5 の RTWQ 対応は wasapi_device.cpp の
+    // みが対象 — ks_device.h 冒頭コメント参照)。
+    bool waveRtActive_ = false;
+    void* waveRtBuffer_ = nullptr;       // KsCreatePin したピンが自動的に所有(明示 unmap 不要)
+    ULONG waveRtBufferSize_ = 0;         // ActualBufferSize(バイト数、周期の2倍ぶん)
+    bool waveRtCallMemoryBarrier_ = false;
+    HANDLE waveRtNotifyEvent_ = nullptr;
+    int waveRtNextHalf_ = 0;             // 次に処理すべき半分(0 or 1)
 
     std::function<void(int frames)> blockCallback_;
     std::atomic<uint64_t> cbCount_{0};

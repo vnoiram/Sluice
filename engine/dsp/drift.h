@@ -144,3 +144,64 @@ private:
     size_t stagePos_ = 0, stageLen_ = 0;
     SRC_STATE* state_ = nullptr;
 };
+
+// --- ASRC 付きリング書き込み(モノラル) -------------------------------------
+// AsrcReader と対称: 固定 INPUT(生産者=バスの mixBuf_ 側のブロックサイズ)・
+// 可変 OUTPUT(出力リングへ書き込む量)。非マスター出力デバイス側のドリフト
+// 補正に使う(実装ガイド §4.3 の考え方を出力側にも適用したもの)。
+//
+// srcRatio の符号規約は AsrcReader と共通: リングの充填率が高い(消費側が
+// 遅い/生産側が速い)ときは出力フレームを減らしたいので、呼び出し側は
+// DriftController の driftRatio に対して 1.0/driftRatio を渡すこと。
+class AsrcWriter {
+public:
+    AsrcWriter(SpscRing<float>& ring, int maxInFrames, Lane lane = Lane::Compat)
+        : ring_(ring), scratch_((size_t)maxInFrames * 4) {
+        int err = 0;
+        const int quality = (lane == Lane::RT) ? SRC_SINC_FASTEST : SRC_SINC_MEDIUM_QUALITY;
+        state_ = src_new(quality, /*channels=*/1, &err);
+        if (!state_) throw std::runtime_error("src_new failed");
+    }
+    ~AsrcWriter() { if (state_) src_delete(state_); }
+    AsrcWriter(const AsrcWriter&) = delete;
+    AsrcWriter& operator=(const AsrcWriter&) = delete;
+
+    // ムーブ構築のみ許可(AsrcReader と同じ理由: ring_ が参照メンバ)。
+    AsrcWriter(AsrcWriter&& other) noexcept
+        : ring_(other.ring_), scratch_(std::move(other.scratch_)), state_(other.state_) {
+        other.state_ = nullptr;
+    }
+    AsrcWriter& operator=(AsrcWriter&&) = delete;
+
+    // 固定 inFrames(呼び出し側のミックス済みバッファ)を srcRatio でリサンプル
+    // し、生成された分をリングへ書く。RT から呼ぶ。
+    // 戻り値: このブロックでオーバーラン(scratch 枯渇 or リング満杯)が
+    //         起きたか。
+    bool Write(const float* in, int inFrames, double srcRatio) {
+        long totalIn = 0;
+        long producedTotal = 0;
+        bool overrun = false;
+        while (totalIn < inFrames) {
+            SRC_DATA d{};
+            d.data_in       = in + totalIn;
+            d.input_frames  = inFrames - totalIn;
+            d.data_out      = scratch_.data() + producedTotal;
+            d.output_frames = (long)scratch_.size() - producedTotal;
+            d.src_ratio     = srcRatio;
+            d.end_of_input  = 0;
+            if (d.output_frames <= 0) { overrun = true; break; }
+            if (src_process(state_, &d) != 0) { overrun = true; break; }
+            totalIn        += d.input_frames_used;
+            producedTotal  += d.output_frames_gen;
+            if (d.input_frames_used == 0 && d.output_frames_gen == 0) break; // 保険
+        }
+        const size_t written = ring_.Write(scratch_.data(), (size_t)producedTotal);
+        if (written < (size_t)producedTotal) overrun = true;
+        return overrun;
+    }
+
+private:
+    SpscRing<float>& ring_;
+    std::vector<float> scratch_;   // 起動前に確保済み。RT 中は伸びない
+    SRC_STATE* state_ = nullptr;
+};

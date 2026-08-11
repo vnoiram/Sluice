@@ -43,6 +43,10 @@ inline JsonValue DeviceReportToJson(const std::string& id, const std::string& na
     v["resetRequested"] = status.resetRequested;
     v["asrcRatio"] = asrcRatio;
     v["supports64"] = caps.supports64;
+    // tools/latencybench の実測値(0 = 未測定)。main.cpp が
+    // ipc::LookupMeasuredLatencyMs で caps へマージしてから渡す
+    // (実装ガイド §5.6、engine/ipc/latency_db.h 参照)。
+    v["measuredLatencyMs"] = caps.measuredLatencyMs;
     return v;
 }
 

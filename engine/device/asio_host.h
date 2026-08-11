@@ -22,8 +22,10 @@
 //   ドライバの CLSID を rclsid と riid の両方に渡すのが ASIO の流儀。
 //
 // 罠 3: 「init/start/stop はドライバごとに気難しい」
-//   init にはウィンドウハンドルを渡す(GetDesktopWindow() で動くものが
-//   多いが、専用の隠しウィンドウが要るドライバもある)。
+//   init にはウィンドウハンドルを渡す必要がある(専用の隠しウィンドウが
+//   要るドライバもある)。本実装は実装ガイド §4.1.5 に従い、ドライバごとに
+//   専用の管理 STA スレッドと専用ウィンドウを持つ(device/sta_thread.h の
+//   StaThread)。全 IASIO 呼び出しはこのスレッド上でのみ行う。
 //   kAsioResetRequest を受けたら RT 外で作り直す必要がある。
 //
 // 罠 4: 「WIN32_LEAN_AND_MEAN と COM ヘッダの相性」
@@ -46,6 +48,7 @@
 #include <vector>
 
 #include "device/iaudio_device.h"
+#include "device/sta_thread.h"          // 実装ガイド §4.1.5: ドライバごとの管理 STA スレッド
 #include "../../asio-abi/asio_abi.h"   // 独自 ABI 実装(ASIO SDK 不要、asio-abi/README.md 参照)
 #include "rt/spsc_ring.h"
 
@@ -79,14 +82,21 @@ public:
     // 既に Open 済み(asio_ != nullptr)の場合は、同一ドライバの二重オープン
     // 禁止(実装ガイド §4.1.5)に配慮し、新規インスタンスは作らず既知の
     // bufferSize_ から簡易的に返す。ASIO は常に RT Lane 候補。
-    DeviceCaps Probe(double sampleRate) override;
+    //
+    // 実装ガイド §4.1.5: このドライバ専用の StaThread(device/sta_thread.h)
+    // 上で実行する薄いラッパ。実体は private の *Impl(下記)。
+    DeviceCaps Probe(double sampleRate) override {
+        return StaThread_().Invoke([&] { return ProbeImpl(sampleRate); });
+    }
 
     // 全工程: CoCreateInstance → init → setSampleRate → createBuffers。
     // config.channels 分の入力 or 出力チャンネルを開く。
-    bool Open(const DeviceStreamConfig& config, std::wstring* errorOut) override;
-    void Start() override;
-    void Stop() override;
-    void Close() override;
+    bool Open(const DeviceStreamConfig& config, std::wstring* errorOut) override {
+        return StaThread_().Invoke([&] { return OpenImpl(config, errorOut); });
+    }
+    void Start() override { StaThread_().Invoke([&] { StartImpl(); }); }
+    void Stop() override { StaThread_().Invoke([&] { StopImpl(); }); }
+    void Close() override { StaThread_().Invoke([&] { CloseImpl(); }); }
 
     SpscRing<float>* CaptureRing(int ch) override;
     SpscRing<float>* RenderRing(int ch) override;
@@ -104,6 +114,10 @@ public:
 
 private:
     // --- トランポリンから呼ばれる実体 ---
+    // ドライバ自身のリアルタイムスレッドから直接呼ばれる(StaThread は
+    // 経由しない)。asio_->start()/stop() が内部で作るスレッドの都合上、
+    // これらを StaThread::Invoke 経由にすると RT レイテンシが不定になる
+    // 上、Stop() 呼び出し中にこのコールバックへ再入するとデッドロックしうる。
     void OnBufferSwitch(long index);
     void OnSampleRateChanged(double srate);
     long OnAsioMessage(long selector, long value);
@@ -112,10 +126,29 @@ private:
     void ConvertChannelToFloat(int c, long index, float* dst) const;
     void ConvertFloatToChannel(int c, long index, const float* src) const;
 
+    // --- Probe/Open/Start/Stop/Close の実体。必ず staThread_ 上で実行される
+    //     (StaThread::Invoke 経由)前提で書かれている。互いを直接
+    //     呼び出してよい(OpenImpl の失敗時に CloseImpl を呼ぶ等)が、
+    //     公開の Open()/Close() 等(Invoke 経由)は絶対に呼ばないこと ——
+    //     既にこのスレッド上で実行中のタスクから自分自身の Invoke を
+    //     待つとデッドロックする(sta_thread.h の注意書き参照)。
+    DeviceCaps ProbeImpl(double sampleRate);
+    bool OpenImpl(const DeviceStreamConfig& config, std::wstring* errorOut);
+    void StartImpl();
+    void StopImpl();
+    void CloseImpl();
+
+    // staThread_ の遅延生成(Probe/Open のどちらが最初に呼ばれても動くように)。
+    StaThread& StaThread_() {
+        if (!staThread_) staThread_ = std::make_unique<StaThread>();
+        return *staThread_;
+    }
+
     // スロット管理(実装は .cpp)
     static bool  AcquireSlot(AsioDevice* self, int* slotOut);
     static void  ReleaseSlot(int slot);
 
+    std::unique_ptr<StaThread> staThread_;
     DriverInfo info_;
     IASIO* asio_ = nullptr;
     int slot_ = -1;

@@ -52,6 +52,15 @@ struct DeviceStreamConfig {
     // 音量補正・空間オーディオ)をバイパスする。既定はオフ(WasapiDevice の
     // みが参照する)。
     bool   rawMode = false;
+
+    // 実装ガイド §5.2.5「排他モード」: true にすると WASAPI 排他モード
+    // (AUDCLNT_SHAREMODE_EXCLUSIVE)で開く。共有モードでは 64 サンプルが
+    // 出せないデバイスを救うための最終手段。デバイスを独占し、同じ
+    // エンドポイントを使う他アプリの再生/録音を止めてしまうため既定は
+    // false(WasapiDevice のみが参照する)。共有→排他の自動フォールバック
+    // 判断は呼び出し側(main.cpp 等)の責務で、Probe() はこのフラグの
+    // 有無に関わらず常に共有モード相当の情報を返す。
+    bool   exclusiveMode = false;
 };
 
 // 実装ガイド §2.3「レーン設計」の中核概念。全経路を 64 サンプルに揃えるのは
