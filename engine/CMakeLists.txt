@@ -59,6 +59,14 @@ if(BUILD_ASIO_HOST)
 
     if(MSVC)
         target_compile_options(sluice-engine PRIVATE /W4 /permissive-)
+        # 実装ガイド §3.2「Release は /O2 /fp:fast /arch:AVX2」。Release
+        # 構成にのみ付ける(Debug は AVX2 を要求しないスカラー経路のまま。
+        # graph/simd_mix.h の #if defined(__AVX2__) と対応)。/O2 と /fp:fast
+        # は CMake の既定 Release フラグ($<CONFIG:Release>)に既に /O2 相当
+        # (/O2)が含まれるため、/fp:fast のみ追加する。
+        target_compile_options(sluice-engine PRIVATE
+            $<$<CONFIG:Release>:/arch:AVX2 /fp:fast>
+        )
     endif()
 endif()
 

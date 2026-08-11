@@ -12,6 +12,7 @@
 #include "dsp/meter.h"
 #include "graph/gain_util.h"
 #include "graph/param_buffer.h"
+#include "graph/simd_mix.h"
 #include "graph/strip.h"
 #include "rt/spsc_ring.h"
 
@@ -38,13 +39,15 @@ public:
     // 全ストリップを busIndex 番目のセンドゲインで重み付けしてミックスし、
     // バスゲイン→リミッタを適用してから出力リングへ書き込む
     // (実装ガイド §5.4.1 の N×M ミックスループ + §5.5 のバス用リミッタ)。
+    // 内側のループ(dst[i] += src[i] * gain)は graph/simd_mix.h の
+    // MixAddScaled に切り出しており、AVX2 でビルドされた場合(既定では
+    // sluice-engine の Release 構成のみ)は 8 サンプル単位で処理される。
     void MixAndWrite(const std::vector<StripRuntime>& strips, int busIndex, int frames) {
         std::fill(mixBuf_.begin(), mixBuf_.begin() + frames, 0.0f);
         for (const auto& s : strips) {
             const float g = s.RoutingGainLinear(busIndex);
             if (g <= 0.0f) continue;
-            const float* src = s.Output();
-            for (int i = 0; i < frames; ++i) mixBuf_[(size_t)i] += src[i] * g;
+            MixAddScaled(mixBuf_.data(), s.Output(), g, frames);
         }
 
         const BusParams p = params_.Current();
