@@ -1,8 +1,9 @@
-# engine — 複数 ASIO デバイス同時駆動 + ドリフト補正パススルー
+# engine — EngineGraph ベースのミキサーエンジン
 
-ASIO デバイス A(入力)の音を ASIO デバイス B(出力)へ、クロックドリフト補正
-(ASRC + PI 制御)付きで流すコンソールアプリ。Voicemeeter 相当のミキサー
-アプリの土台となるエンジンプロセスの最小実装(Phase 0)。
+ASIO / WASAPI / DirectKS / プロセスループバック / VB-CABLE / VAC を同時に開き、
+`graph/engine_graph.h` の N×M ルーティング行列(ストリップ→バス、実装ガイド
+§5.4)へ配線するコンソールアプリ。Voicemeeter 相当のミキサーアプリの
+エンジンプロセス本体(実装ガイド M1)。
 
 ## 必要なもの
 
@@ -32,30 +33,58 @@ cmake --build build --config Release
 ## 実行
 
 ```bat
-:: ドライバ一覧を表示
+:: 全バックエンドのデバイス一覧を表示(index は各バックエンド内で独立)
 build\Release\sluice-engine.exe --list
 
-:: 例: ドライバ 0 を入力、ドライバ 2 を出力にしてパススルー開始
-build\Release\sluice-engine.exe --in 0 --out 2
+:: 例: ASIO ドライバ 0 を入力、ASIO ドライバ 2 を出力にして起動
+:: (--auto-route を付けないと全ルーティングgainはミュートのままなので、
+::  音を出すには起動後に set_param で routingGain を設定するか、
+::  お試し用に --auto-route を付ける)
+build\Release\sluice-engine.exe --asio-in 0 --asio-out 2 --auto-route
+
+:: 例: WASAPI マイク(capture index 0)を ASIO 出力(driver 1)へ、
+::     64 サンプル低遅延要求つきで
+build\Release\sluice-engine.exe --wasapi-in 0 --asio-out 1 --low-latency --auto-route
+
+:: 例: VB-CABLE を仮想入力として使う(要 VB-CABLE インストール済み)
+build\Release\sluice-engine.exe --vbcable-in --asio-out 0 --auto-route
 ```
 
-実行中は 1 秒ごとに統計行が出る:
+CLI オプション一覧:
+
+| オプション | 意味 |
+|---|---|
+| `--list` | 開かずにデバイス一覧(ASIO/WASAPI/KS/VB-CABLE/VAC)を表示して終了 |
+| `--asio-in`/`--asio-out <idx>` | ASIO ドライバを入力/出力として追加(複数回指定可、同一ドライバの二重指定は不可) |
+| `--wasapi-in`/`--wasapi-out <idx>` | WASAPI エンドポイントを追加(`--list` の index) |
+| `--ks-in`/`--ks-out <idx>` | DirectKS デバイスを追加(実機未検証、実装ガイド §6 参照) |
+| `--loopback-pid <pid>` | 指定 PID(と子プロセス)の再生音をキャプチャ入力として追加 |
+| `--vbcable-in`/`--vbcable-out` | VB-CABLE を自動検出して追加(未インストールならエラー終了) |
+| `--vac-line <n>` | VAC の Line N を自動検出して追加(capture/render 両方あれば両方) |
+| `--channels <n>` | デバイスへ要求するチャンネル数(既定 2。WASAPI はミックスフォーマット優先で無視される) |
+| `--low-latency` | 実装ガイド §5.2.3 の「積極的低遅延モード」をオプトイン(WASAPI に 64 サンプル要求 + RAW モード) |
+| `--auto-route` | 全ストリップを全バスへ 0dB で送る(既定は全ルーティングgainがミュート) |
+
+起動時と、デバイスリセット時・1 秒ごとの統計に、各デバイスの xrun・実効
+レイテンシ・レーンが出る:
 
 ```
-fill=50.2%  ratio=1.0000132  xrun(in=0 out=0)  cb(A=93750 B=93748)
+devices=2 strips=2 buses=2
+  [0] asio/in "Focusrite Scarlett 2i2"  xrun=0  latency=1.33ms  lane=RT
+  [1] asio/out "Focusrite Scarlett 2i2" *master*  xrun=0  latency=1.33ms  lane=RT
 ```
 
-- `fill`: リングバッファ充填率。50% 付近で安定していれば正常
-- `ratio`: ドリフト補正比。起動後 30〜60 秒かけて一定値に収束し、
-  その値が 2 デバイス間の実クロック差(ppm)を表す
-- `xrun`: アンダーラン/オーバーラン回数。**収束後は増えないこと**が合格条件
+IPC(名前付きパイプ `\\.\pipe\sluice-engine`、実装ガイド §5.6)で
+`get_devices`・`get_topology`・`set_param`(strip/bus のゲイン・ミュート・
+ソロ・ルーティング・EQ/ゲート/コンプ/リミッタ)・`add_strip`・
+`remove_strip` が呼べる。`devices_changed` push 通知も届く。
 
-## 合格基準(実装ガイド §4.4)
+## 合格基準(実装ガイド §4.4、Phase 0 PoC 由来。マルチデバイス構成にも適用される)
 
 1. 4 時間連続で収束後の xrun = 0
-2. ratio が一定値に収束
+2. ASRC 比が一定値に収束
 3. サイン波を入力しループバック録音した波形に不連続なし
-4. 出力デバイスのコンパネでバッファサイズ変更 → 自動復帰(kAsioResetRequest)
+4. 出力デバイスのコンパネでバッファサイズ変更 → 自動復帰(kAsioResetRequest 相当)
 5. RT スレッド内アロケーション 0
 
 ## 構成
@@ -90,7 +119,8 @@ graph/
                     (実装ガイド §5.4)
   strip.h / bus.h   入力ストリップ / 出力バス(N×M ルーティング、実装ガイド §5.4.1)
   param_buffer.h    制御→RT のトリプルバッファ(実装ガイド §5.4.2)
-  master_clock.h    マスタークロック候補選定(RT Lane のみ、実装ガイド §2.3)
+  master_clock.h    マスタークロック候補選定(RT Lane のみ、実装ガイド §2.3)。
+                    main.cpp の OpenAndBuild() から実際に呼ばれる
 dsp/
   drift.h           PI コントローラ + libsamplerate ラッパ(ASRC)。Lane 別に
                     SRC_SINC_FASTEST/MEDIUM_QUALITY を選択(実装ガイド §4.3.2)
@@ -168,15 +198,22 @@ Windows ホスト側の PowerShell から実行すると、Docker Desktop(Window
 `engine/thirdparty/asiosdk` を配置していれば `sluice-engine.exe` の実ビルド
 まで、配置していなければコアテストのみを回す。
 
-## 既知の簡略化(PoC の意図的な割り切り)
+## 既知の簡略化(意図的な割り切り)
 
-- `AsioDevice`/`IAudioDevice` 自体は `DeviceStreamConfig.channels` で任意の
-  チャンネル数を扱えるが、`main.cpp` のパススルーデモは現状ステレオ固定
-  (`kChannels = 2`)
+- デバイス構成はプロセス起動時の CLI 引数で固定する。実行中に新規デバイスを
+  追加する IPC は無い(`add_strip`/`remove_strip` は「既に開いている
+  デバイスのチャンネル」に対するストリップの増減のみ)
+- マスタークロック以外の出力デバイスはドリフト補正されない
+  (`InputBoundary`/ASRC は入力側にしか無い、`main.cpp` 冒頭コメント参照)。
+  複数の出力デバイスを使う構成では、マスター以外の出力デバイスのクロックが
+  ずれると長時間で xrun しうる。対称な「出力バウンダリ」の実装は将来課題
 - サンプル型は Int32LSB / Float32LSB のみ対応(他はエラー表示)
-- kAsioResetRequest は「全体を作り直す」最単純対応
+- kAsioResetRequest(および WASAPI/KS の resetRequested)は「全体を作り直す」
+  最単純対応。個々のデバイスだけを差し替える部分再構築は行わない
 - ドライバ操作は main スレッド(STA)で実施。製品版ではドライバごとの
   管理スレッドに分離する(実装ガイド §4.1.2)
+- KS バックエンドは Windows 実機でのコンパイル・動作検証が未実施
+  (`device/ks_device.h` 冒頭コメント参照)
 
 ## 注意
 
