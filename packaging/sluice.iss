@@ -1,4 +1,4 @@
-; sluice.iss : Inno Setup インストーラスクリプト(実装ガイド §5.8)
+; sluice.iss : Inno Setup インストーラスクリプト(実装ガイド §5.7)
 ;
 ; ビルド済みの sluice-engine.exe(engine/ を CMake --build 済み)と
 ; SluiceUi(ui/SluiceUi を `dotnet publish` 済み)をまとめてインストーラ化
@@ -6,7 +6,7 @@
 ; 必要で、本リポジトリには同梱していない(ツール自体は各自インストール
 ; する)。
 ;
-; 署名について(実装ガイド §5.8): exe/DLL/インストーラは SignPath
+; 署名について(実装ガイド §5.7): exe/DLL/インストーラは SignPath
 ; Foundation での署名を想定している。申請には公開リポジトリ・OSS
 ; ライセンス・CI ビルド(GitHub Actions)・署名ポリシー明記が必要。
 ; 署名自体はこのスクリプトの外(SignPath 連携の CI)で行うため、
@@ -40,9 +40,9 @@ SolidCompression=yes
 ArchitecturesInstallIn64BitMode=x64compatible
 DisableProgramGroupPage=yes
 
-; ASIO/VB-CABLE の商標・ライセンス表記(実装ガイド §10)
+; ASIO/VB-CABLE/VAC の商標・ライセンス表記(実装ガイド §12)
 [Messages]
-FinishedLabel=%nSetup has finished installing [name] on your computer.%n%nASIO is a trademark and software of Steinberg Media Technologies GmbH.%n仮想マイク機能を使うには VB-CABLE(公式サイトから別途入手)が必要です。
+FinishedLabel=%nSetup has finished installing [name] on your computer.%n%nASIO is a trademark and software of Steinberg Media Technologies GmbH.%n仮想マイク機能を使うには VB-CABLE または VAC(Virtual Audio Cable、いずれも公式サイトから別途入手)が必要です。
 
 [Files]
 ; ビルド成果物の配置は各自の CI/ローカルビルドに合わせて調整すること。

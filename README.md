@@ -148,11 +148,13 @@ Foundation)に関する未実施のアクションアイテムは
 - **ASIO SDK** は Steinberg のライセンスに同意して各自取得すること。SDK
   ソースの再配布・リポジトリへのコミットは禁止されている。
 - "ASIO is a trademark and software of Steinberg Media Technologies GmbH"。
-- **VB-CABLE** は同梱・自動ダウンロードしない。ユーザーに公式サイトからの
-  インストールを案内するのみ(実装ガイド §5.6)。
+- **VB-CABLE** および **VAC (Virtual Audio Cable)** は同梱・自動ダウンロード
+  しない。ユーザーに公式サイトからのインストールを案内するのみ
+  (実装ガイド §7.2/§12)。
 - **SmartScreen について**: `sluice-engine.exe`/`SluiceUi.exe`/インストーラ
-  は現時点で未署名(SignPath Foundation への署名申請は公開リポジトリ・CI
-  整備が前提のため未着手。`packaging/README.md` 参照)。初回起動時に
+  は現時点で未署名(SignPath Foundation への署名申請はリポジトリの公開が
+  前提のため未着手。CI は整備済み、`.github/workflows/ci.yml`。
+  `packaging/README.md` 参照)。初回起動時に
   Windows SmartScreen が「発行元不明」の警告を出すことがある。その場合は
   「詳細情報」→「実行」を選ぶことで起動できる(自己責任での実行になる点、
   配布時にユーザーへ明示すること)。
