@@ -11,7 +11,7 @@
 //   → 出力/入力 比は 1 より小さくする(ratio = 1 / drift)
 //
 // チャンネル数について: エンジン内部フォーマットは float32 / プレーナ
-// (実装ガイド §2.3)。つまり 1 チャンネル = 1 SpscRing<float> であり、
+// (実装ガイド §2.4)。つまり 1 チャンネル = 1 SpscRing<float> であり、
 // AsrcReader もモノラル(1 チャンネル 1 インスタンス)。複数チャンネルを
 // 同期させたい場合は、同じ DriftController が出す srcRatio を全チャンネル
 // 分の AsrcReader に共通で渡す(呼び出し側=エンジン境界の責務)。
@@ -21,6 +21,7 @@
 #include <stdexcept>
 #include <vector>
 
+#include "device/iaudio_device.h"  // Lane
 #include "rt/spsc_ring.h"
 
 // --- PI コントローラ ------------------------------------------------------
@@ -74,10 +75,14 @@ private:
 // src_process 内ではアロケーションしない。ハンドルは必ず起動前に作ること。
 class AsrcReader {
 public:
-    AsrcReader(SpscRing<float>& ring, int maxOutFrames)
+    // lane: 実装ガイド §4.3.2/付録A「64 サンプルでは SRC_SINC_MEDIUM_QUALITY
+    // は重い。RT Lane は SRC_SINC_FASTEST、Compat Lane は品質を上げる」。
+    // 既定は Lane::Compat(既存呼び出し側の動作を変えないため)。
+    AsrcReader(SpscRing<float>& ring, int maxOutFrames, Lane lane = Lane::Compat)
         : ring_(ring), stage_((size_t)maxOutFrames * 4) {
         int err = 0;
-        state_ = src_new(SRC_SINC_MEDIUM_QUALITY, /*channels=*/1, &err);
+        const int quality = (lane == Lane::RT) ? SRC_SINC_FASTEST : SRC_SINC_MEDIUM_QUALITY;
+        state_ = src_new(quality, /*channels=*/1, &err);
         if (!state_) throw std::runtime_error("src_new failed");
     }
     ~AsrcReader() { if (state_) src_delete(state_); }

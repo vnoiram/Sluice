@@ -124,6 +124,49 @@ size_t RingCapacityFor(long bufferSize) {
 }
 }  // namespace
 
+// ===========================================================================
+// 能力プローブ(実装ガイド §5.1・§4.1.4)
+// ===========================================================================
+DeviceCaps AsioDevice::Probe(double sampleRate) {
+    DeviceCaps caps;
+    caps.recommendedLane = Lane::RT;  // ASIO は常に RT Lane 候補
+
+    if (asio_) {
+        // 二重オープン禁止(実装ガイド §4.1.5)のため新規インスタンスは作らず、
+        // 既に確定している bufferSize_ から簡易的に返す。
+        caps.minPeriodFrames = caps.defaultPeriodFrames = (uint32_t)bufferSize_;
+        caps.supports64 = (bufferSize_ == 64);
+        return caps;
+    }
+
+    IASIO* probe = nullptr;
+    HRESULT hr = CoCreateInstance(info_.clsid, nullptr, CLSCTX_INPROC_SERVER,
+                                  info_.clsid, reinterpret_cast<void**>(&probe));
+    if (FAILED(hr) || !probe) return caps;
+
+    if (probe->init(GetDesktopWindow()) != ASIOTrue) {
+        probe->Release();
+        return caps;
+    }
+
+    if (probe->canSampleRate(sampleRate) == ASE_OK) probe->setSampleRate(sampleRate);
+
+    long mn = 0, mx = 0, preferred = 0, granularity = 0;
+    if (probe->getBufferSize(&mn, &mx, &preferred, &granularity) == ASE_OK) {
+        caps.minPeriodFrames = (uint32_t)mn;
+        caps.defaultPeriodFrames = (uint32_t)preferred;
+        caps.fundamentalFrames = granularity > 0 ? (uint32_t)granularity : 0;
+        // 実装ガイド §4.1.4 の 64 サンプル合法性判定:
+        // 64 >= min && 64 <= max && (granularity <= 0(2 の冪のみ許容) ||
+        // (64-min) % granularity == 0)
+        caps.supports64 = (64 >= mn && 64 <= mx) &&
+                           (granularity <= 0 || (64 - mn) % granularity == 0);
+    }
+
+    probe->Release();
+    return caps;
+}
+
 bool AsioDevice::Open(const DeviceStreamConfig& config, std::wstring* errorOut) {
     auto fail = [&](const wchar_t* msg) {
         if (errorOut) *errorOut = msg;
@@ -259,7 +302,7 @@ void AsioDevice::OnBufferSwitch(long index) {
         if (blockCallback_) blockCallback_((int)n);  // 「新しい入力データが来た」通知
     } else {
         // レンダー: まずエンジンにブロック境界を通知し、RenderRing へ
-        // 新しいデータを書き込ませる(実装ガイド §5.4.2 のマスター
+        // 新しいデータを書き込ませる(実装ガイド §5.4.1 のマスター
         // コールバックに相当)。そのあとで RenderRing を読み出して出力する。
         if (blockCallback_) blockCallback_((int)n);
         for (int c = 0; c < channels_; ++c) {

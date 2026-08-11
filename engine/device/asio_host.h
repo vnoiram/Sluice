@@ -74,6 +74,13 @@ public:
     ~AsioDevice() override { Close(); }
     AsioDevice(const AsioDevice&) = delete;
 
+    // 実装ガイド §5.1・§4.1.4: createBuffers はせず、CoCreateInstance→init→
+    // getBufferSize→Release だけの使い捨てインスタンスで軽量に判定する。
+    // 既に Open 済み(asio_ != nullptr)の場合は、同一ドライバの二重オープン
+    // 禁止(実装ガイド §4.1.5)に配慮し、新規インスタンスは作らず既知の
+    // bufferSize_ から簡易的に返す。ASIO は常に RT Lane 候補。
+    DeviceCaps Probe(double sampleRate) override;
+
     // 全工程: CoCreateInstance → init → setSampleRate → createBuffers。
     // config.channels 分の入力 or 出力チャンネルを開く。
     bool Open(const DeviceStreamConfig& config, std::wstring* errorOut) override;

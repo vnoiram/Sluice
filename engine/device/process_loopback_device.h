@@ -51,6 +51,16 @@ public:
     ~ProcessLoopbackDevice() override { Close(); }
     ProcessLoopbackDevice(const ProcessLoopbackDevice&) = delete;
 
+    // ActivateAudioInterfaceAsync は IAudioClient3 の周期交渉に対応しない
+    // ため、常に固定値(supports64=false, Lane::Compat)を返す
+    // (実装ガイド §2.3: プロセスループバックは常に Compat Lane)。
+    DeviceCaps Probe(double /*sampleRate*/) override {
+        DeviceCaps caps;
+        caps.recommendedLane = Lane::Compat;
+        caps.supports64 = false;
+        return caps;
+    }
+
     // config.sampleRate/channels がそのまま要求フォーマット(float32)になる。
     bool Open(const DeviceStreamConfig& config, std::wstring* errorOut) override;
     void Start() override;
