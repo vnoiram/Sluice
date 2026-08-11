@@ -152,6 +152,65 @@ public sealed class EngineClient : IDisposable
         return devices;
     }
 
+    // 現在のストリップ/バス構成を取得する(実装ガイド §5.6 get_topology、
+    // engine/main.cpp の BuildTopologyJson と対になる)。
+    public TopologyInfo GetTopology()
+    {
+        JsonNode? result = Call("get_topology");
+        return result is JsonObject obj ? TopologyInfo.FromJson(obj) : new TopologyInfo();
+    }
+
+    // ストリップのパラメータを部分更新する。null のフィールドは変更しない
+    // (engine 側の set_param ハンドラは受け取ったキーだけを上書きする)。
+    public void SetStripParam(int index, double? gainDb = null, bool? mute = null,
+                              bool? solo = null, IReadOnlyList<double>? routingGain = null)
+    {
+        var parameters = new JsonObject { ["target"] = "strip", ["index"] = index };
+        if (gainDb is not null) parameters["gainDb"] = gainDb.Value;
+        if (mute is not null) parameters["mute"] = mute.Value;
+        if (solo is not null) parameters["solo"] = solo.Value;
+        if (routingGain is not null)
+        {
+            var arr = new JsonArray();
+            foreach (double g in routingGain) arr.Add(g);
+            parameters["routingGain"] = arr;
+        }
+        Call("set_param", parameters);
+    }
+
+    // バスのパラメータを部分更新する。
+    public void SetBusParam(int index, double? gainDb = null)
+    {
+        var parameters = new JsonObject { ["target"] = "bus", ["index"] = index };
+        if (gainDb is not null) parameters["gainDb"] = gainDb.Value;
+        Call("set_param", parameters);
+    }
+
+    // 既に開いているデバイスの空きチャンネル(boundaryIndex で指定)に対して
+    // 新しいストリップを追加する。デバイスそのものの実行時追加には対応して
+    // いない(engine/main.cpp のコメント参照)。戻り値は新しいストリップの
+    // index(get_topology で参照する番号と一致)。
+    public int AddStrip(int boundaryIndex, int channel, double? gainDb = null)
+    {
+        var parameters = new JsonObject
+        {
+            ["boundaryIndex"] = boundaryIndex,
+            ["channel"] = channel,
+        };
+        if (gainDb is not null) parameters["gainDb"] = gainDb.Value;
+        JsonNode? result = Call("add_strip", parameters);
+        return result is JsonObject obj && obj.TryGetPropertyValue("index", out JsonNode? n) &&
+               n is not null
+            ? n.GetValue<int>()
+            : -1;
+    }
+
+    // ストリップを削除する。削除後、それ以降のストリップの index は 1 つずつ
+    // 詰まる(engine/main.cpp: state->strips.erase())ため、呼び出し側は
+    // 削除後に GetTopology() を取り直すこと。
+    public void RemoveStrip(int index) =>
+        Call("remove_strip", new JsonObject { ["index"] = index });
+
     public void Dispose()
     {
         _writer.Dispose();
