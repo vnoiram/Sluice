@@ -4,10 +4,9 @@ param(
 )
 
 # Windows Docker コンテナ内(Dockerfile.engine.windows と同じイメージ)で実行する。
-# BUILD_VASIO_DRIVER は CMakeLists.txt の既定どおり ON のままにし、マウントされた
-# ソースツリーに engine/thirdparty/asiosdk が無ければ自動的に OFF へフォールバック
-# する(vasio.dll はスキップされるが、shared_protocol.h のオフラインテストは
-# 常にビルド・実行できる)。
+# BUILD_VASIO_DRIVER は CMakeLists.txt の既定どおり ON のままにする。ASIO SDK は
+# 不要(../asio-abi/ の独自 ABI 実装でビルドする、asio-abi/README.md 参照)なので、
+# vasio.dll の実ビルドと shared_protocol.h のオフラインテストを常に両方行う。
 
 $ErrorActionPreference = "Stop"
 $Root = (Resolve-Path (Join-Path $PSScriptRoot "..")).ProviderPath

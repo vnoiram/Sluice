@@ -1,13 +1,12 @@
 # CI(実装ガイド §9.2 の SignPath Foundation 申請前提「CI(GitHub Actions等)
 # でのビルド」を満たすために追加)。
 #
-# ASIO SDK は Steinberg のライセンス上リポジトリにもこの CI にも置けない
-# ため、engine/vasio 両方の CMakeLists.txt が自動フォールバックする
-# BUILD_ASIO_HOST=OFF / BUILD_VASIO_DRIVER=OFF の経路で動く。つまり
-# sluice-engine.exe 本体・vasio.dll 本体は CI ではビルドされず、
-# プラットフォーム非依存のコアテスト・WASAPI/KS/vasio ブリッジのコンパイル
-# 確認・tools/latencybench・tools/devprobe・UI(.NET)のみを検証する
-# (engine/README.md・vasio/README.md の「検証状況」節と同じ制約)。
+# ASIO SDK は不要(engine/・vasio/ とも asio-abi/ の独自 ABI 実装でビルドする、
+# asio-abi/README.md 参照)なので、sluice-engine.exe 本体・vasio.dll 本体を
+# CI で実際にビルドできる(以前は Steinberg の SDK をこの CI に置けないため
+# フォールバック経路=コアテストのみしか検証できなかった)。DAW からの実際の
+# ロード確認・実 ASIO デバイスとの通信確認は実機が要るため、CI の範囲外
+# (engine/README.md・vasio/README.md の「検証状況」節を参照)。
 #
 # 各ジョブは Windows Docker 経由のローカル開発スクリプト
 # (scripts/build-*-in-windows-docker.ps1)が最終的に呼ぶのと同じ

@@ -45,11 +45,15 @@ Of Phase 3 (kernel virtual audio device), the angle where a DAW reaches it via A
 
 ## Build and Test
 
-### engine/: real build with ASIO SDK (Windows, physical machine)
+The ASIO SDK is not required. Both `engine/` and `vasio/` build against
+[`asio-abi/`](asio-abi/README.md), an independent clean-room ABI
+implementation (same approach as wineasio) instead of Steinberg's SDK, so
+`sluice-engine.exe`/`vasio.dll` build for real without fetching any
+external SDK.
 
-See `engine/README.md`. The ASIO SDK cannot be committed to the repository because of Steinberg's license, so each developer must place it under `engine/thirdparty/asiosdk`.
+### engine/: real build + core regression tests (Windows)
 
-### engine/: core regression tests only (no ASIO SDK)
+See `engine/README.md`.
 
 If Windows build tools are not available locally, such as when working from WSL, use Docker Desktop on the Windows host in Windows container mode:
 
@@ -58,16 +62,16 @@ If Windows build tools are not available locally, such as when working from WSL,
 .\scripts\build-engine-tests-in-windows-docker.ps1
 ```
 
-`Dockerfile.engine.windows` builds an image with VS Build Tools, CMake, and vcpkg/libsamplerate, then `docker run` mounts the source and executes `engine\scripts\run-tests.ps1`. If `engine/thirdparty/asiosdk` exists it also performs the real ASIO build; otherwise it automatically falls back to core tests only.
+`Dockerfile.engine.windows` builds an image with VS Build Tools, CMake, and vcpkg/libsamplerate, then `docker run` mounts the source and executes `engine\scripts\run-tests.ps1`. Both the real `sluice-engine.exe` build and the core tests always run.
 
-### vasio/: virtual ASIO driver build check (partially works without the ASIO SDK)
+### vasio/: virtual ASIO driver build check
 
 ```powershell
 # From Windows PowerShell
 .\scripts\build-vasio-in-windows-docker.ps1
 ```
 
-Reuses `Dockerfile.engine.windows`. If `engine/thirdparty/asiosdk` exists it builds `vasio.dll` for real; otherwise it automatically falls back to the shared-memory-protocol offline test (`test_shared_protocol`) only. See [`vasio/README.md`](vasio/README.md) for how to register the driver with `regsvr32` and verify it loads in a real DAW (this cannot be verified inside Docker).
+Reuses `Dockerfile.engine.windows` and builds `vasio.dll` for real alongside the shared-memory-protocol offline test (`test_shared_protocol`). See [`vasio/README.md`](vasio/README.md) for how to register the driver with `regsvr32` and verify it loads in a real DAW (this cannot be verified inside Docker).
 
 ### ui/: WPF build check and IPC client tests
 
@@ -84,8 +88,8 @@ Reuses `Dockerfile.engine.windows`. If `engine/thirdparty/asiosdk` exists it bui
 
 ## License and Trademark Notes
 
-- **ASIO SDK** must be obtained by each developer after accepting Steinberg's license. Redistributing SDK source or committing it to this repository is prohibited.
-- "ASIO is a trademark and software of Steinberg Media Technologies GmbH".
-- **VB-CABLE** is not bundled or automatically downloaded. Users are only directed to install it from the official site (implementation guide section 5.6).
-- **SmartScreen**: `sluice-engine.exe`, `SluiceUi.exe`, and the installer are currently unsigned. SignPath Foundation signing has not started because it requires a public repository and CI setup. Windows SmartScreen may show an "unknown publisher" warning on first launch. Users can choose "More info" -> "Run anyway", but this is at their own risk and must be clearly communicated when distributing.
+- **The ASIO SDK is not required.** Neither `engine/` nor `vasio/` uses Steinberg's SDK; both build against [`asio-abi/`](asio-abi/README.md), an independent clean-room ABI implementation (same approach as wineasio).
+- "ASIO is a trademark and software of Steinberg Media Technologies GmbH". `asio-abi/` is not provided, endorsed, or reviewed by Steinberg -- it is an independent, ABI-compatible implementation.
+- **VB-CABLE** and **VAC (Virtual Audio Cable)** are not bundled or automatically downloaded. Users are only directed to install them from the official sites (implementation guide section 7.2/12).
+- **SmartScreen**: `sluice-engine.exe`, `SluiceUi.exe`, and the installer are currently unsigned. SignPath Foundation signing has not started because it requires the repository to be public (CI is already in place, see `.github/workflows/ci.yml`). Windows SmartScreen may show an "unknown publisher" warning on first launch. Users can choose "More info" -> "Run anyway", but this is at their own risk and must be clearly communicated when distributing.
 - Detailed design decisions and phase plans live under local `docs/`, but those documents are not included in the repository because they contain personal working notes and are ignored by `.gitignore`.

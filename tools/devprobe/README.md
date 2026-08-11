@@ -4,9 +4,10 @@ WASAPI/DirectKS の各デバイスに `IAudioDevice::Probe()`(実装ガイド §
 §5.2.1)を呼び、64 サンプル対応可否・推奨レーン(RT/Compat)・周期情報を
 一覧表示する。実際に `Open()`/`Start()` はしない軽量な事前確認ツール。
 
-ASIO は対象外(`tools/latencybench` と同じ理由で、非再配布の ASIO SDK への
-依存を避けている)。ASIO デバイスの能力確認は
-`sluice-engine.exe --list`(`engine/main.cpp`)を使うこと。
+ASIO は対象外(`tools/latencybench` と同じ、WASAPI/KS だけの軽量ツールに
+留める方針。ASIO SDK が不要になったこと自体はもう理由にならないが、
+`asio-abi/` を使った ASIO 列挙対応は本ツールでは未着手)。ASIO デバイスの
+能力確認は `sluice-engine.exe --list`(`engine/main.cpp`)を使うこと。
 
 ## ビルド
 

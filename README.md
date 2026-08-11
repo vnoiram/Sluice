@@ -78,12 +78,13 @@ ASIO4ALL / ASIO2KS と同じ手法(= `KsDevice`)で個別対応なしに到達�
 
 ## ビルド・テスト
 
-### engine/: ASIO SDK ありの実ビルド(Windows, 実機)
+ASIO SDK は不要。`engine/`・`vasio/` とも [`asio-abi/`](asio-abi/README.md)
+の独自 ABI 実装(Steinberg の SDK を使わないクリーンルーム実装)を使うため、
+外部 SDK の取得・配置なしに `sluice-engine.exe`/`vasio.dll` を実ビルドできる。
 
-`engine/README.md` を参照。ASIO SDK は Steinberg のライセンス上リポジトリに
-コミットできないため、各自 `engine/thirdparty/asiosdk` に配置する。
+### engine/: 実ビルド + コア回帰テスト(Windows)
 
-### engine/: コア回帰テストのみ(ASIO SDK 不要)
+`engine/README.md` を参照。
 
 WSL 等で Windows のビルドツールが手元にない場合、Windows ホスト側の
 Docker Desktop(Windows コンテナモード)を使う:
@@ -95,24 +96,23 @@ Docker Desktop(Windows コンテナモード)を使う:
 
 `Dockerfile.engine.windows` で VS Build Tools + CMake + vcpkg/libsamplerate
 を用意したイメージをビルドし、`docker run` でソースをマウントして
-`engine\scripts\run-tests.ps1` を実行する。ASIO SDK が
-`engine/thirdparty/asiosdk` にあれば実 ASIO ビルドまで、無ければコア
-テストのみ自動でフォールバックする。
+`engine\scripts\run-tests.ps1` を実行する。`sluice-engine.exe` の実ビルドと
+コアテストの両方が常に走る。
 
-### vasio/: 仮想 ASIO ドライバのビルド確認(ASIO SDK 不要でも一部実行可)
+### vasio/: 仮想 ASIO ドライバのビルド確認
 
 ```powershell
 # Windows PowerShell から
 .\scripts\build-vasio-in-windows-docker.ps1
 ```
 
-`Dockerfile.engine.windows` を再利用し、`engine/thirdparty/asiosdk` があれば
-`vasio.dll` の実ビルドまで、無ければ共有メモリプロトコルのオフラインテスト
-(`test_shared_protocol`)のみ自動でフォールバックする。DAW からの実際の
-ロード確認・`regsvr32` での登録手順は [`vasio/README.md`](vasio/README.md)
-参照(実機での確認が必要、Docker では検証不可)。
+`Dockerfile.engine.windows` を再利用し、`vasio.dll` の実ビルドと共有メモリ
+プロトコルのオフラインテスト(`test_shared_protocol`)の両方を行う。DAW
+からの実際のロード確認・`regsvr32` での登録手順は
+[`vasio/README.md`](vasio/README.md) 参照(実機での確認が必要、Docker
+では検証不可)。
 
-### tools/latencybench/: 仮想デバイス実測ベンチマーク(ASIO SDK 不要)
+### tools/latencybench/: 仮想デバイス実測ベンチマーク
 
 ```powershell
 # Windows PowerShell から
@@ -145,9 +145,12 @@ Foundation)に関する未実施のアクションアイテムは
 
 ## ライセンス・商標に関する注意
 
-- **ASIO SDK** は Steinberg のライセンスに同意して各自取得すること。SDK
-  ソースの再配布・リポジトリへのコミットは禁止されている。
+- **ASIO SDK は不要**。`engine/`・`vasio/` とも Steinberg の SDK を使わず、
+  [`asio-abi/`](asio-abi/README.md) の独自 ABI 実装(クリーンルーム実装、
+  wineasio 等と同じ考え方)でビルドする。
 - "ASIO is a trademark and software of Steinberg Media Technologies GmbH"。
+  `asio-abi/` は Steinberg 社によって提供・承認・監修されたものではない、
+  独立した ABI 互換実装である。
 - **VB-CABLE** および **VAC (Virtual Audio Cable)** は同梱・自動ダウンロード
   しない。ユーザーに公式サイトからのインストールを案内するのみ
   (実装ガイド §7.2/§12)。

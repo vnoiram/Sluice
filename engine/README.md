@@ -10,22 +10,20 @@ ASIO / WASAPI / DirectKS / プロセスループバック / VB-CABLE / VAC を�
 - Windows 10/11 x64
 - Visual Studio 2022(C++ デスクトップ開発ワークロード)
 - CMake 3.25+
-- **ASIO SDK**(Steinberg 開発者サイトから無償入手。ライセンス同意が必要)
 - libsamplerate(vcpkg で導入)
 - ASIO デバイス 2 つ(片方は FlexASIO で代用可。ただし同一ドライバの
   二重指定は不可)
 
+ASIO SDK は不要。[`asio-abi/`](../asio-abi/README.md)(リポジトリ直下)の
+独自 ABI 実装(Steinberg の SDK を使わないクリーンルーム実装)でビルドする。
+
 ## セットアップ
 
 ```bat
-:: 1. ASIO SDK を配置(SDK のソースはリポジトリにコミットしないこと)
-::    ダウンロードした asiosdk_2.3.3 等を以下に展開:
-::    engine/thirdparty/asiosdk/common/iasiodrv.h が存在する状態にする
-
-:: 2. libsamplerate
+:: 1. libsamplerate
 vcpkg install libsamplerate:x64-windows
 
-:: 3. ビルド
+:: 2. ビルド
 cmake -B build -S . -DCMAKE_TOOLCHAIN_FILE=%VCPKG_ROOT%/scripts/buildsystems/vcpkg.cmake
 cmake --build build --config Release
 ```
@@ -156,9 +154,11 @@ tests/
   test_crash_handler.cpp         クラッシュダンプ収集の実結合テスト(Windows)
 scripts/
   run-tests.ps1       Windows Docker コンテナ内で cmake configure/build/ctest を実行
-thirdparty/
-  asiosdk/            ASIO SDK(各自配置。.gitignore 対象、リポジトリには含まれない)
 ```
+
+ASIO 関連の ABI 定義・COM ボイラープレートは `engine/` 配下ではなく
+リポジトリ直下の [`asio-abi/`](../asio-abi/README.md)(`engine/`・`vasio/`
+共通)にある。
 
 エンジン内部フォーマットは float32 / プレーナ(チャンネルごとに独立した
 `SpscRing<float>`、実装ガイド §2.4)。`IAudioDevice::CaptureRing(ch)` /
@@ -167,14 +167,15 @@ thirdparty/
 「自分の RT スレッドで自分のリングに読み書きするだけ」に責務を絞っている
 (実装ガイド §5.1)。
 
-## コア回帰テスト(ASIO SDK 不要)
+## コア回帰テスト(Windows 以外でもビルド可)
 
-`rt/spsc_ring.h` と `dsp/drift.h` は Windows API にも ASIO SDK にも依存しない
-プラットフォーム非依存のコードなので、ASIO SDK が手元になくても常にビルド・
-実行できる。CMake は `BUILD_ASIO_HOST` / `BUILD_TESTS` の 2 オプションで
-`sluice-engine.exe`(実 ASIO パススルー)とテストを分離しており、ASIO SDK
-未配置時は自動的に `BUILD_ASIO_HOST=OFF` にフォールバックしてテストのみ
-ビルドする。
+`rt/spsc_ring.h` と `dsp/drift.h` は Windows API に依存しないプラットフォーム
+非依存のコードなので、Windows 以外(この Linux/WSL 環境を含む)でも常に
+ビルド・実行できる。CMake は `BUILD_ASIO_HOST` / `BUILD_TESTS` の 2
+オプションで `sluice-engine.exe` とテストを分離しており、
+`BUILD_ASIO_HOST` は Windows 以外では自動的に OFF にフォールバックする
+(COM/WASAPI/KS が Windows API 前提のため。ASIO SDK は既に不要 —
+`asio-abi/` 参照)。
 
 ```bat
 cmake -B build -S . -DCMAKE_TOOLCHAIN_FILE=%VCPKG_ROOT%/scripts/buildsystems/vcpkg.cmake ^
@@ -199,10 +200,9 @@ ctest --test-dir build -C Release --output-on-failure
 Windows ホスト側の PowerShell から実行すると、Docker Desktop(Windows
 コンテナモード)で VS Build Tools + CMake + vcpkg/libsamplerate 環境を
 用意してビルド・テストまで自動で行う(詳細はリポジトリルートの README
-参照)。`BUILD_ASIO_HOST` は CMakeLists.txt の既定(ASIO SDK があれば ON、
-なければ自動で OFF にフォールバック)のまま呼んでいるので、
-`engine/thirdparty/asiosdk` を配置していれば `sluice-engine.exe` の実ビルド
-まで、配置していなければコアテストのみを回す。
+参照)。`BUILD_ASIO_HOST` は CMakeLists.txt の既定(ON)のまま呼んでいるので、
+Windows コンテナでは常に `sluice-engine.exe` の実ビルドとコアテストの
+両方を行う。
 
 ## 既知の簡略化(意図的な割り切り)
 
@@ -223,7 +223,8 @@ Windows ホスト側の PowerShell から実行すると、Docker Desktop(Window
 
 ## 注意
 
-本コードはリファレンス実装であり、環境(ASIO SDK のバージョン、ドライバの癖)
-によって微修正が必要になる可能性がある。特に `device/asio_host.cpp` 冒頭の
-コメントに記載した「コールバック・トランポリン」の仕組みを理解してから
-読み進めること。
+本コードはリファレンス実装であり、環境(ドライバの癖)によって微修正が
+必要になる可能性がある。特に `device/asio_host.cpp` 冒頭のコメントに
+記載した「コールバック・トランポリン」の仕組みを理解してから読み進めること。
+`IASIO` の ABI 定義自体(asio-abi/)を変更する際は
+[`asio-abi/README.md`](../asio-abi/README.md)の注意事項を必ず確認すること。

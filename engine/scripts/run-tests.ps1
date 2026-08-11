@@ -4,11 +4,10 @@ param(
 )
 
 # Runs inside the Windows Docker container (Dockerfile.engine.windows).
-# BUILD_ASIO_HOST is left at its CMakeLists.txt default (ON, with automatic
-# fallback to OFF if engine/thirdparty/asiosdk is not present in the mounted
-# source tree) so this builds sluice-engine.exe for real whenever the ASIO
-# SDK has been placed by the caller, and still degrades gracefully to
-# core-tests-only when it hasn't.
+# BUILD_ASIO_HOST is left at its CMakeLists.txt default (ON). No ASIO SDK is
+# required -- engine/ builds against ../asio-abi/ (an independent clean-room
+# ABI implementation, see asio-abi/README.md) -- so this always builds
+# sluice-engine.exe for real on Windows, not just the core tests.
 
 $ErrorActionPreference = "Stop"
 $Root = (Resolve-Path (Join-Path $PSScriptRoot "..")).ProviderPath

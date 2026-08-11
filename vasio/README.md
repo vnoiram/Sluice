@@ -10,24 +10,22 @@ COM DLL(実装ガイド §8.1)。engine プロセスが未接続の間は無音�
 - Windows 10/11 x64
 - Visual Studio 2022(C++ デスクトップ開発ワークロード)
 - CMake 3.25+
-- **ASIO SDK**(Steinberg 開発者サイトから無償入手。ライセンス同意が必要。
-  `engine/README.md` と同じ配置場所 `engine/thirdparty/asiosdk` を共有する。
-  SDK のソースはリポジトリにコミットしないこと)
+
+ASIO SDK は不要。[`../asio-abi/`](../asio-abi/README.md)(リポジトリ直下、
+`engine/` と共通)の独自 ABI 実装(Steinberg の SDK を使わないクリーンルーム
+実装)でビルドする。
 
 ## ビルド
 
 ```bat
-:: ASIO SDK は engine/thirdparty/asiosdk に配置済みである前提
-:: (engine/README.md 参照。vasio と engine で共有する)
-
 cmake -B build -S .
 cmake --build build --config Release
 ```
 
-`engine/thirdparty/asiosdk` が無い場合は `vasio.dll` の実ビルドをスキップし、
-`shared_protocol.h` のオフラインテスト(`test_shared_protocol`)のみを実行する
-(`BUILD_VASIO_DRIVER` オプション、`engine/CMakeLists.txt` の
-`BUILD_ASIO_HOST` と同じ自動フォールバック方式)。
+`vasio.dll` の実ビルドと `shared_protocol.h` のオフラインテスト
+(`test_shared_protocol`)を常に両方行う(`BUILD_VASIO_DRIVER` オプションは
+Windows 以外で自動的に OFF になる。`engine/CMakeLists.txt` の
+`BUILD_ASIO_HOST` と同じ方式)。
 
 ### Windows Docker での自動ビルド/テスト
 
@@ -44,7 +42,7 @@ regsvr32 build\Release\vasio.dll
 
 - `regsvr32` は内部で `DllRegisterServer` を呼び、`HKCR\CLSID\{...}` と
   `HKLM\SOFTWARE\ASIO\Sluice Virtual ASIO` の両方を登録する
-  (`common/register.cpp` の `RegisterAsioDriver`、実装ガイド §8.1 手順2)。
+  (`../asio-abi/asio_registry.h` の `RegisterAsioDriver`、実装ガイド §8.1 手順2)。
 - 32bit DAW から見えるようにするには 32bit 版 `vasio.dll` を別途ビルドし、
   32bit 版 `regsvr32`(`%SystemRoot%\SysWOW64\regsvr32.exe`)で登録する。
   現状の CMakeLists.txt は単一アーキテクチャのみ(64bit)を想定しており、
@@ -97,9 +95,10 @@ regsvr32 build\Release\vasio.dll
 
 ## 注意
 
-本コードはリファレンス実装であり、`engine/` 側と同様に環境(ASIO SDK の
-バージョン、DAW ごとの ASIO ホスト実装の癖)によって微修正が必要になる
-可能性がある。COM ボイラープレート(`CFactoryTemplate`/`CUnknown`/
-`CClassFactory`)は ASIO SDK 付属の `common/combase.cpp`・`common/dllentry.cpp`
-をそのままリンクしており、driver/asiosample/asiosmpl.cpp と同じ土台を使う
-(自作していない)。
+本コードはリファレンス実装であり、`engine/` 側と同様に環境(DAW ごとの
+ASIO ホスト実装の癖)によって微修正が必要になる可能性がある。COM
+ボイラープレート(単一 CLSID 用クラスファクトリ、`DllGetClassObject`/
+`DllCanUnloadNow`)は ASIO SDK を使わず
+[`../asio-abi/com_server.h`](../asio-abi/com_server.h) の独自実装を使う
+(`driver/asiosample/asiosmpl.cpp` を当初の構成の参考にしたが、SDK のコードは
+一切リンクしていない)。

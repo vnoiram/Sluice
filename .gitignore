@@ -9,7 +9,9 @@
 build/
 out/
 
-# ASIO SDK 等、ライセンス上リポジトリにコミットしてはならない外部 SDK
+# ASIO SDK 等、ライセンス上リポジトリにコミットしてはならない外部 SDK。
+# ビルドには不要になった(asio-abi/ の独自 ABI 実装を使う、
+# asio-abi/README.md 参照)。開発時の事実確認用に任意で置く場合のみ対象。
 /engine/thirdparty/
 # 誤ってリポジトリルート直下に展開した場合の保険
 /ASIOSDK/

@@ -7,8 +7,9 @@ param(
 # vasio/ (仮想 ASIO ドライバ、実装ガイド §8.1) のビルド/テスト。
 # 既存の scripts/build-engine-tests-in-windows-docker.ps1 と同じ Dockerfile.engine.windows
 # イメージを再利用する(vasio は追加の vcpkg 依存を持たず、VS Build Tools + CMake だけで
-# 足りるため)。ASIO SDK がマウントされたソースツリーに無ければ vasio.dll はスキップされ、
-# shared_protocol.h のオフラインテストのみが実行される(vasio/CMakeLists.txt 参照)。
+# 足りるため)。ASIO SDK は不要(../asio-abi/ の独自 ABI 実装でビルドする、
+# asio-abi/README.md 参照)なので、vasio.dll の実ビルドと shared_protocol.h の
+# オフラインテストを常に両方実行する(vasio/CMakeLists.txt 参照)。
 
 $ErrorActionPreference = "Stop"
 $Root = (Resolve-Path (Join-Path $PSScriptRoot "..")).ProviderPath
