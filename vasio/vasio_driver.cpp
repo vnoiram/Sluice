@@ -108,7 +108,9 @@ bool SluiceVasioDriver::ConnectSharedMemory() {
     // ring 容量は「エンジン側ブロックサイズの数十倍」を確保しておき、DAW 側の
     // 要求バッファサイズ(createBuffers 時に変わりうる)より十分大きく取る。
     // 実装ガイド §4.2 の RT Lane 容量係数(ブロック×32〜64)に合わせる。
-    constexpr uint32_t kRingCapacityFrames = 8192;
+    // 値は shared_protocol.h の kDefaultRingCapacityFrames 1 箇所で管理する
+    // (engine 側コンシューマと食い違うと ComputeLayout() の結果がずれる)。
+    constexpr uint32_t kRingCapacityFrames = vasio::kDefaultRingCapacityFrames;
     layout_ = vasio::ComputeLayout(kRingCapacityFrames);
 
     mapping_ = CreateFileMappingW(INVALID_HANDLE_VALUE, nullptr, PAGE_READWRITE, 0,

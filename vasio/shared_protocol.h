@@ -47,6 +47,14 @@ namespace vasio {
 constexpr uint32_t kProtocolVersion = 1;
 constexpr int kMaxChannels = 8;  // 既定 8in/8out(実装ガイド §8.1 手順1)
 
+// 各チャンネルリングの容量(フレーム数)。vasio.dll 側(vasio_driver.cpp の
+// ConnectSharedMemory)と engine 側コンシューマ(engine/device/
+// vasio_bridge_device.cpp)の両方が、共有メモリを新規作成する側になった
+// ときにこの値で ComputeLayout() を呼ぶ必要がある。どちらが先に接続しても
+// 同じレイアウトになるよう、値をこのヘッダ 1 箇所にのみ定義する
+// (以前は vasio_driver.cpp 内にローカル定数として重複していた)。
+constexpr uint32_t kDefaultRingCapacityFrames = 8192;
+
 enum class ConnectionState : uint32_t {
     Disconnected = 0,  // エンジンプロセス未接続、または切断中。vasio は無音を返し続ける
                         // (実装ガイド §8.1 手順5「切断耐性」)
