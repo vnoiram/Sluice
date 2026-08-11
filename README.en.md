@@ -2,17 +2,17 @@
 
 An audio routing/mixer application for Windows. It aims to provide Voicemeeter-like functionality while also supporting simultaneous use of multiple ASIO devices and an unlimited number of inputs and outputs.
 
-## Current Status: Phase 1 (Mixer Engine In Progress)
+## Current Status: Phase 1 (Mixer Engine In Progress), Phase 1.5/2 partially started
 
-`engine/` contains the major building blocks from implementation guide section 5: device abstraction, engine graph, DSP, and IPC. `ui/` contains a minimal WPF control UI.
+`engine/` contains the major building blocks from implementation guide section 5: device abstraction, engine graph, DSP, and IPC. `ui/` contains a minimal WPF control UI. Phase 1.5 (KS backend) and Phase 2 (virtual ASIO driver) have also been started.
 
-- **device/**: `IAudioDevice` interface and implementations: `AsioDevice` for real ASIO passthrough from Phase 0, `WasapiDevice` for shared-mode capture/render, `ProcessLoopbackDevice` for per-process loopback capture, and VB-CABLE virtual device detection.
+- **device/**: `IAudioDevice` interface and implementations: `AsioDevice` for real ASIO passthrough from Phase 0, `WasapiDevice` for shared-mode capture/render, `ProcessLoopbackDevice` for per-process loopback capture, `KsDevice` for the DirectKS backend (Phase 1.5), and VB-CABLE/VAC virtual device detection.
 - **graph/**: strip/bus N x M routing matrix and RCU-style topology replacement (`GraphHandle`).
 - **dsp/**: clock drift correction (ASRC + PI control), 4-band EQ, gate, compressor, limiter, and metering.
-- **ipc/**: JSON-RPC-like control API over named pipes.
-- **ui/SluiceUi**: system tray resident WPF settings UI. `SluiceUi.Core` connects to engine IPC through `EngineClient`.
+- **ipc/**: JSON-RPC-like control API over named pipes. `get_devices` returns the device list (lane, effective latency, xrun, ASRC ratio), and a `devices_changed` push notification (`PipeServer::Notify()`) keeps it updated automatically (implementation guide section 5.6).
+- **ui/SluiceUi**: system tray resident WPF settings UI. `SluiceUi.Core` connects to engine IPC through `EngineClient` and displays/auto-updates the device list.
 
-**Not integrated yet**: these parts build and test independently, but `engine/main.cpp` is still the Phase 0 simple 1-to-1 ASIO passthrough demo. It has not yet been wired into a working mixer app using graph/ipc because multi-device integration testing on real hardware is still needed.
+**Not integrated yet**: `graph/` (engine graph, N x M routing) builds and tests independently, but `engine/main.cpp` is still the Phase 0 simple 1-to-1 ASIO passthrough demo — it has not yet been wired into a working mixer app using `EngineGraph`, since multi-device integration testing on real hardware is still needed. IPC (`get_devices`/push notifications) is already wired to this Phase-0 device pair (devIn/devOut); the JSON schema (a device array) is designed not to change once `EngineGraph` integration lands.
 
 See [`engine/README.md`](engine/README.md) for details.
 
@@ -32,12 +32,16 @@ ui/
   SluiceUi.Core/   WPF-independent IPC client (EngineClient)
   SluiceUi.Core.Tests/  EngineClient regression tests
   scripts/         build/test scripts for Windows Docker containers
+vasio/             virtual ASIO driver (vasio.dll, Phase 2): the COM driver
+                   itself, the shared-memory protocol, and offline tests
+                   (see vasio/README.md). The engine-side shared-memory
+                   consumer is not implemented yet.
 Dockerfile.engine.windows   Windows container image for engine build/test
 Dockerfile.ui.windows       Windows container image for ui build/test (dotnet SDK)
 scripts/           Windows Docker launcher scripts from the repository root
 ```
 
-Future phases are expected to add `vasio/` (virtual ASIO driver, Phase 2) and `kmdriver/` (kernel virtual audio device, Phase 3).
+Of Phase 3 (kernel virtual audio device), the angle where a DAW reaches it via ASIO is already covered by `engine/device/ks_device.h` (the DirectKS backend). Per implementation guide section 1.2, once a PortCls miniport driver exists it becomes automatically visible from WASAPI, DirectSound, MME, and DirectKS alike, so ASIO hosts can reach it the same way ASIO4ALL/ASIO2KS do (via `KsDevice`) without any ASIO-specific work (implementation guide section 6.2). A future phase is still expected to add `kmdriver/` (the WDM/PortCls miniport driver itself), but that kernel-driver work is currently on hold and not yet started.
 
 ## Build and Test
 
@@ -55,6 +59,15 @@ If Windows build tools are not available locally, such as when working from WSL,
 ```
 
 `Dockerfile.engine.windows` builds an image with VS Build Tools, CMake, and vcpkg/libsamplerate, then `docker run` mounts the source and executes `engine\scripts\run-tests.ps1`. If `engine/thirdparty/asiosdk` exists it also performs the real ASIO build; otherwise it automatically falls back to core tests only.
+
+### vasio/: virtual ASIO driver build check (partially works without the ASIO SDK)
+
+```powershell
+# From Windows PowerShell
+.\scripts\build-vasio-in-windows-docker.ps1
+```
+
+Reuses `Dockerfile.engine.windows`. If `engine/thirdparty/asiosdk` exists it builds `vasio.dll` for real; otherwise it automatically falls back to the shared-memory-protocol offline test (`test_shared_protocol`) only. See [`vasio/README.md`](vasio/README.md) for how to register the driver with `regsvr32` and verify it loads in a real DAW (this cannot be verified inside Docker).
 
 ### ui/: WPF build check and IPC client tests
 

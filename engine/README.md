@@ -60,22 +60,64 @@ fill=50.2%  ratio=1.0000132  xrun(in=0 out=0)  cb(A=93750 B=93748)
 
 ## 構成
 
-実装ガイド §2.4 の推奨リポジトリ構成に合わせている(今はまだ device/dsp/rt
-のみで、graph/ipc は Phase 1 以降に追加する)。
+実装ガイド §2.5 の推奨リポジトリ構成に合わせている。
 
 ```
 CMakeLists.txt
-main.cpp            エントリポイント。列挙・起動・統計表示
+main.cpp            エントリポイント。列挙・起動・統計表示・IPC 配線
 device/
-  iaudio_device.h   デバイス抽象化インターフェース(実装ガイド §5.1)
+  iaudio_device.h   デバイス抽象化インターフェース。Lane/DeviceCaps/Probe()
+                    を含む(実装ガイド §5.1・§2.3)
   asio_host.h/.cpp  IAudioDevice を実装する ASIO ドライバのラッパ(要点は .h のコメント参照)
+  wasapi_device.h/.cpp  IAudioDevice を実装する WASAPI 共有モード capture/render
+                    (実装ガイド §5.2)。IAudioClient3 の 64 サンプル要求・
+                    AUDCLNT_E_ENGINE_PERIODICITY_LOCKED 正常系対応を含む
+  wasapi_period.h   周期選択の純粋ロジック(ChoosePeriodFrames、実装ガイド §5.2.1)。
+                    Windows API 非依存でオフラインテスト可能
+  process_loopback_device.h/.cpp  プロセス別ループバックキャプチャ(実装ガイド §5.3)
+  ks_device.h/.cpp  IAudioDevice を実装する DirectKS(Kernel Streaming)バックエンド
+                    (実装ガイド §6, Phase 1.5)。素の KS ストリーミング I/O
+                    (ReadFile/WriteFile + KSSTREAM_HEADER)を使い、WaveRT には
+                    未対応(要点は .h 冒頭の罠コメント参照)。Phase 3(カーネル
+                    仮想オーディオデバイス)が将来公開する KS エンドポイントに
+                    ASIO4ALL/ASIO2KS と同じ手法で到達できる経路でもある
+                    (実装ガイド §1.2・§6.2)。
+  vb_cable.h        VB-CABLE 仮想デバイス検出(実装ガイド §7.1/§7.2)
+  vac.h             VAC (Virtual Audio Cable) 仮想デバイス検出。最大256本の
+                    "Line N" ペアに対応(実装ガイド §7.1/§7.2)
+graph/
+  engine_graph.h    エンジングラフ本体、InputBoundary、RCU 方式のグラフ差し替え
+                    (実装ガイド §5.4)
+  strip.h / bus.h   入力ストリップ / 出力バス(N×M ルーティング、実装ガイド §5.4.1)
+  param_buffer.h    制御→RT のトリプルバッファ(実装ガイド §5.4.2)
+  master_clock.h    マスタークロック候補選定(RT Lane のみ、実装ガイド §2.3)
 dsp/
-  drift.h           PI コントローラ + libsamplerate ラッパ(ASRC、モノラル)
+  drift.h           PI コントローラ + libsamplerate ラッパ(ASRC)。Lane 別に
+                    SRC_SINC_FASTEST/MEDIUM_QUALITY を選択(実装ガイド §4.3.2)
+  biquad.h / eq.h / gate.h / compressor.h / limiter.h / meter.h  DSP モジュール一式(実装ガイド §5.5)
+ipc/
+  json_value.h      IPC 用の最小 JSON エンコード/デコード(実装ガイド §5.6)
+  pipe_server.h     名前付きパイプ JSON-RPC サーバ。get_devices・push 通知
+                    (devices_changed)に対応(実装ガイド §5.6)
+  device_report.h   DeviceStatus/DeviceCaps → JSON 変換の純粋関数。Windows API
+                    非依存でオフラインテスト可能
 rt/
   spsc_ring.h       ロックフリー SPSC リングバッファ
+crash/
+  crash_handler.h/.cpp  クラッシュダンプ収集(実装ガイド §5.7)
+version.h            バージョン情報(実装ガイド §5.7)
 tests/
-  test_spsc_ring.cpp  SPSC リングのマルチスレッドストレステスト
-  test_drift.cpp      FakeDevice によるドリフト補正の回帰テスト(実装ガイド §8)
+  test_spsc_ring.cpp             SPSC リングのマルチスレッドストレステスト
+  test_drift.cpp                 FakeDevice によるドリフト補正の回帰テスト(実装ガイド §10)
+  test_engine_graph.cpp          N×M ミックス・RCU・マスタークロック選定の回帰テスト
+  test_dsp_modules.cpp           DSP モジュール単体テスト
+  test_json_value.cpp            JSON エンコード/デコードの回帰テスト
+  test_device_report_json.cpp    device_report.h の回帰テスト
+  test_wasapi_period_selection.cpp  ChoosePeriodFrames の回帰テスト
+  test_ipc_pipe.cpp              名前付きパイプ IPC の実結合テスト(Windows)
+  test_wasapi_compile.cpp        WasapiDevice/ProcessLoopbackDevice/VB-CABLE/VAC のコンパイル確認(Windows)
+  test_ks_compile.cpp            KsDevice のコンパイル確認(Windows)
+  test_crash_handler.cpp         クラッシュダンプ収集の実結合テスト(Windows)
 scripts/
   run-tests.ps1       Windows Docker コンテナ内で cmake configure/build/ctest を実行
 thirdparty/
@@ -83,7 +125,7 @@ thirdparty/
 ```
 
 エンジン内部フォーマットは float32 / プレーナ(チャンネルごとに独立した
-`SpscRing<float>`、実装ガイド §2.3)。`IAudioDevice::CaptureRing(ch)` /
+`SpscRing<float>`、実装ガイド §2.4)。`IAudioDevice::CaptureRing(ch)` /
 `RenderRing(ch)` はチャンネルごとに 1 本のリングを返す。ASRC/ドリフト補正は
 デバイス実装の外(エンジン境界 = `main.cpp`)に置き、`AsioDevice` 自身は
 「自分の RT スレッドで自分のリングに読み書きするだけ」に責務を絞っている
@@ -107,7 +149,7 @@ ctest --test-dir build -C Release --output-on-failure
 
 - `test_spsc_ring`: 1 プロデューサ・1 コンシューマで単一要素/可変長バッチの
   Write/Read を大量に流し、順序保証・欠落なし・RT 区間アロケーション 0 件を検証。
-- `test_drift`: 実装ガイド §8 の FakeDevice 相当(ドリフト+ジッタを注入した
+- `test_drift`: 実装ガイド §10 の FakeDevice 相当(ドリフト+ジッタを注入した
   仮想デバイス)で、実時間 30 分相当のソークテストを圧縮シミュレーションで
   数十秒に短縮して実行。±400ppm(補正上限 500ppm 未満)のドリフトで収束後
   xrun=0・fill 率が 50% 近辺で安定することを確認する。

@@ -5,28 +5,37 @@ English version: [README.en.md](README.en.md)
 Windows 向け音声ルーティング/ミキサーアプリ。Voicemeeter 相当の機能に加え、
 「複数 ASIO デバイスの同時利用」「入出力数の無制限」を目指す OSS。
 
-## 現在の状況: Phase 1(ミキサーエンジン実装中)
+## 現在の状況: Phase 1(ミキサーエンジン実装中)・Phase 1.5/2 一部着手
 
 `engine/` に、実装ガイド §5 の構成要素(デバイス抽象化・エンジングラフ・
 DSP・IPC)を一通り実装済み。`ui/` に最小限の WPF コントロール UI がある。
+Phase 1.5(KS バックエンド)と Phase 2(仮想 ASIO ドライバ)にも着手済み。
 
 - **device/**: `IAudioDevice` インターフェースと、その実装
   `AsioDevice`(実 ASIO パススルー、Phase 0 の成果を移植)・
   `WasapiDevice`(共有モード capture/render)・
   `ProcessLoopbackDevice`(プロセス別ループバックキャプチャ)・
-  VB-CABLE 仮想デバイス検出。
+  `KsDevice`(DirectKS バックエンド、Phase 1.5)・
+  VB-CABLE / VAC 仮想デバイス検出。
 - **graph/**: ストリップ/バスの N×M ルーティング行列、RCU 方式の
   トポロジ差し替え(`GraphHandle`)。
 - **dsp/**: クロックドリフト補正(ASRC + PI 制御)、4 バンド EQ、
   ゲート、コンプレッサ、リミッタ、メータリング。
-- **ipc/**: 名前付きパイプでの JSON-RPC 的制御 API。
+- **ipc/**: 名前付きパイプでの JSON-RPC 的制御 API。`get_devices` で
+  デバイス一覧(レーン・実効レイテンシ・xrun・ASRC 比)を取得でき、
+  `devices_changed` push 通知(`PipeServer::Notify()`)で自動更新も届く
+  (実装ガイド §5.6)。
 - **ui/SluiceUi**: システムトレイ常駐 + 設定ウィンドウ(WPF)。
-  `SluiceUi.Core` の `EngineClient` で engine の IPC に接続する。
+  `SluiceUi.Core` の `EngineClient` で engine の IPC に接続し、
+  デバイス一覧を表示・自動更新する。
 
-**未統合の部分**: 上記はそれぞれ単体ではビルド・テスト済みだが、
-`engine/main.cpp` は今も Phase 0 のシンプルな 1 対 1 ASIO パススルー
-デモのままで、graph/ipc を使った「実際に動くミキサーアプリ」への
-配線はまだ行っていない(実機での複数デバイス統合テストが必要なため)。
+**未統合の部分**: `graph/`(エンジングラフ・N×M ルーティング)は単体では
+ビルド・テスト済みだが、`engine/main.cpp` は今も Phase 0 のシンプルな
+1 対 1 ASIO パススルーデモのままで、`EngineGraph` を使った「実際に動く
+ミキサーアプリ」への配線はまだ行っていない(実機での複数デバイス統合
+テストが必要なため)。IPC(`get_devices`/push 通知)はこの Phase-0
+デバイス(devIn/devOut)に対して既に配線済み — 将来 `EngineGraph` に
+統合されても JSON スキーマ(デバイス配列)は変わらない設計。
 
 詳細は [`engine/README.md`](engine/README.md) を参照。
 
@@ -46,13 +55,26 @@ ui/
   SluiceUi.Core/   WPF 非依存の IPC クライアント(EngineClient)
   SluiceUi.Core.Tests/  EngineClient の回帰テスト
   scripts/         Windows Docker コンテナ内で実行するビルド/テストスクリプト
+vasio/             仮想 ASIO ドライバ(vasio.dll, Phase 2)。DAW から見える
+                   COM ドライバ本体・共有メモリプロトコル・オフラインテスト
+                   (詳細は vasio/README.md)。engine 側の共有メモリ
+                   コンシューマ実装は未着手。
+tools/latencybench/  仮想デバイス実測ベンチマークツール(実装ガイド §7.3)。
+                   M 系列再生+相互相関で往復レイテンシを測定する
+                   (詳細は tools/latencybench/README.md)。
 Dockerfile.engine.windows   engine/ のビルド/テスト用 Windows コンテナイメージ
 Dockerfile.ui.windows       ui/ のビルド/テスト用 Windows コンテナイメージ(dotnet SDK)
 scripts/           リポジトリルートから叩く Windows Docker 起動スクリプト
 ```
 
-将来的に `vasio/`(仮想 ASIO ドライバ, Phase 2)、`kmdriver/`(カーネル
-仮想オーディオデバイス, Phase 3)を追加していく想定。
+Phase 3(カーネル仮想オーディオデバイス)のうち、DAW から ASIO 経由で到達する
+角度は `engine/device/ks_device.h`(DirectKS バックエンド)が既にカバーして
+いる。実装ガイド §1.2 の通り、PortCls ミニポートを正しく書けば WASAPI /
+DirectSound / MME / DirectKS のすべてから自動的に見えるため、ASIO ホストは
+ASIO4ALL / ASIO2KS と同じ手法(= `KsDevice`)で個別対応なしに到達できる
+(実装ガイド §6.2)。将来的に `kmdriver/`(WDM/PortCls ミニポートドライバ
+本体)を追加していく想定だが、カーネルドライバの実装自体は現時点では対応
+方針を保留しており、着手していない。
 
 ## ビルド・テスト
 
@@ -76,6 +98,32 @@ Docker Desktop(Windows コンテナモード)を使う:
 `engine\scripts\run-tests.ps1` を実行する。ASIO SDK が
 `engine/thirdparty/asiosdk` にあれば実 ASIO ビルドまで、無ければコア
 テストのみ自動でフォールバックする。
+
+### vasio/: 仮想 ASIO ドライバのビルド確認(ASIO SDK 不要でも一部実行可)
+
+```powershell
+# Windows PowerShell から
+.\scripts\build-vasio-in-windows-docker.ps1
+```
+
+`Dockerfile.engine.windows` を再利用し、`engine/thirdparty/asiosdk` があれば
+`vasio.dll` の実ビルドまで、無ければ共有メモリプロトコルのオフラインテスト
+(`test_shared_protocol`)のみ自動でフォールバックする。DAW からの実際の
+ロード確認・`regsvr32` での登録手順は [`vasio/README.md`](vasio/README.md)
+参照(実機での確認が必要、Docker では検証不可)。
+
+### tools/latencybench/: 仮想デバイス実測ベンチマーク(ASIO SDK 不要)
+
+```powershell
+# Windows PowerShell から
+.\scripts\build-latencybench-in-windows-docker.ps1
+```
+
+`Dockerfile.engine.windows` を再利用する。`latencybench.exe` 本体は Windows
+専用ビルドだが、信号生成・相互相関のオフラインテスト(`test_xcorr`)は
+プラットフォーム非依存。実デバイスでの使い方は
+[`tools/latencybench/README.md`](tools/latencybench/README.md) 参照
+(実機での確認が必要、Docker では検証不可)。
 
 ### ui/: WPF アプリのビルド確認 + IPC クライアントのテスト
 
