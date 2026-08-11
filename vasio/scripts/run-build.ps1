@@ -1,6 +1,12 @@
 ﻿[CmdletBinding()]
 param(
-  [string]$BuildDir = "build-vasio"
+  [string]$BuildDir = "build-vasio",
+  # gap 11: 32bit DAW 対応。vasio.dll は CMakeLists.txt 自体が
+  # アーキテクチャに依存しないため(レジストリ登録も KEY_WOW64_* を
+  # 使わず呼び出し元プロセスのビットネスに自然追従する、
+  # asio-abi/asio_registry.cpp 参照)、-Platform Win32 を渡すだけで
+  # 32bit DAW 用の vasio.dll をビルドできる。既定は x64。
+  [string]$Platform = "x64"
 )
 
 # Windows Docker コンテナ内(Dockerfile.engine.windows と同じイメージ)で実行する。
@@ -14,12 +20,14 @@ param(
 # コンテナを起動するため、両方とも相対パス "build" のままだと同じ
 # C:\work\build を取り合い、片方を実行した後にもう片方を実行すると
 # 「異なる CMakeLists.txt から生成された既存キャッシュと一致しない」エラーに
-# なる(実機での Windows Docker ビルドで確認済みの実バグ)。
+# なる(実機での Windows Docker ビルドで確認済みの実バグ)。同じ理由で
+# x64/Win32 ビルドも別ディレクトリにする必要がある(呼び出し側が
+# -BuildDir を variant ごとに変えること)。
 
 $ErrorActionPreference = "Stop"
 $Root = (Resolve-Path (Join-Path $PSScriptRoot "..")).ProviderPath
 
-& cmake -S $Root -B $BuildDir -G "Visual Studio 17 2022" -A x64
+& cmake -S $Root -B $BuildDir -G "Visual Studio 17 2022" -A $Platform
 if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
 & cmake --build $BuildDir --config Release

@@ -43,10 +43,17 @@ regsvr32 build\Release\vasio.dll
 - `regsvr32` は内部で `DllRegisterServer` を呼び、`HKCR\CLSID\{...}` と
   `HKLM\SOFTWARE\ASIO\Sluice Virtual ASIO` の両方を登録する
   (`../asio-abi/asio_registry.h` の `RegisterAsioDriver`、実装ガイド §8.1 手順2)。
-- 32bit DAW から見えるようにするには 32bit 版 `vasio.dll` を別途ビルドし、
-  32bit 版 `regsvr32`(`%SystemRoot%\SysWOW64\regsvr32.exe`)で登録する。
-  現状の CMakeLists.txt は単一アーキテクチャのみ(64bit)を想定しており、
-  32bit 対応は将来課題。
+- gap 11: 32bit DAW から見えるようにするには 32bit 版 `vasio.dll` を別途
+  ビルドし、32bit 版 `regsvr32`(`%SystemRoot%\SysWOW64\regsvr32.exe`)で
+  登録する。`CMakeLists.txt` 自体はアーキテクチャに依存しない(レジストリ
+  登録も `KEY_WOW64_*` を使わず、呼び出し元プロセス(`regsvr32.exe` /
+  `regsvr32.exe` の SysWOW64 版)のビットネスに自然に追従する、
+  `../asio-abi/asio_registry.cpp` 参照)ため、32bit 版のビルドは
+  `scripts/build-vasio-x86-in-windows-docker.ps1`(`-A Win32` で configure
+  するだけ)で行える。64bit 版と 32bit 版は別々の CLSID/レジストリキーを
+  共有する設計ではない点に注意(同じ `CLSID_SluiceVasio` を両方に登録して
+  問題ないが、同時に両方の DAW から接続する複数インスタンス対応は別課題、
+  下記参照)。
 - 登録解除は `regsvr32 /u build\Release\vasio.dll`。
 
 ## CLSID について
@@ -93,7 +100,9 @@ regsvr32 build\Release\vasio.dll
   DAW に伝える経路)は実装済み(`VasioBridgeDevice::RequestDawReset()`、
   `engine/main.cpp` の監視ループがマスタークロックのブロックサイズ変化を
   検出したときに呼ぶ)。Windows 実機・実 DAW での動作確認は未実施
-- 32bit DAW 対応、複数インスタンス対応は将来課題
+- 32bit DAW 対応はビルド面(`scripts/build-vasio-x86-in-windows-docker.ps1`)
+  では対応済み(上記参照)。複数インスタンス対応(現状 instanceId 固定
+  "0" の共有メモリ命名を拡張する必要がある)は将来課題のまま。
 
 ## 注意
 
