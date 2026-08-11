@@ -83,3 +83,9 @@ if(EXISTS "${CMAKE_SOURCE_DIR}/../tools/latencybench/CMakeLists.txt")
     add_subdirectory("${CMAKE_SOURCE_DIR}/../tools/latencybench"
                      "${CMAKE_BINARY_DIR}/tools/latencybench")
 endif()
+
+# tools/devprobe(実装ガイド §2.5)も同じ方針で取り込む。
+if(EXISTS "${CMAKE_SOURCE_DIR}/../tools/devprobe/CMakeLists.txt")
+    add_subdirectory("${CMAKE_SOURCE_DIR}/../tools/devprobe"
+                     "${CMAKE_BINARY_DIR}/tools/devprobe")
+endif()
