@@ -10,6 +10,7 @@
 
 #include "graph/engine_graph.h"
 #include "graph/gain_util.h"
+#include "graph/master_clock.h"
 #include "rt/spsc_ring.h"
 
 #include <atomic>
@@ -268,12 +269,60 @@ void TestRcuStress() {
                 kPublishCount, (long long)blocksProcessed.load());
 }
 
+// ===========================================================================
+// SelectMasterClockCandidates(実装ガイド §2.3「マスタークロックは RT Lane の
+// デバイスからのみ選択可能」)のオフライン回帰テスト。
+// ===========================================================================
+class FakeLaneDevice : public IAudioDevice {
+public:
+    explicit FakeLaneDevice(Lane lane) : lane_(lane) {}
+
+    DeviceCaps Probe(double) override { return DeviceCaps{}; }
+    bool Open(const DeviceStreamConfig&, std::wstring*) override { return true; }
+    void Start() override {}
+    void Stop() override {}
+    void Close() override {}
+    SpscRing<float>* CaptureRing(int) override { return nullptr; }
+    SpscRing<float>* RenderRing(int) override { return nullptr; }
+    DeviceStatus Status() const override {
+        DeviceStatus s;
+        s.lane = lane_;
+        return s;
+    }
+    void SetBlockCallback(std::function<void(int)>) override {}
+
+private:
+    Lane lane_;
+};
+
+void TestMasterClockSelection() {
+    FakeLaneDevice rtA(Lane::RT);
+    FakeLaneDevice compatB(Lane::Compat);
+    FakeLaneDevice rtC(Lane::RT);
+
+    std::vector<IAudioDevice*> all = {&rtA, &compatB, &rtC};
+    auto rtOnly = engine::SelectMasterClockCandidates(all);
+    if (rtOnly.size() != 2) Fail("SelectMasterClockCandidates: expected 2 RT-lane devices");
+    if (rtOnly[0] != &rtA || rtOnly[1] != &rtC)
+        Fail("SelectMasterClockCandidates: order not preserved or wrong devices selected");
+
+    std::vector<IAudioDevice*> compatOnly = {&compatB};
+    if (!engine::SelectMasterClockCandidates(compatOnly).empty())
+        Fail("SelectMasterClockCandidates: Compat-only input should yield no candidates");
+
+    if (!engine::SelectMasterClockCandidates({}).empty())
+        Fail("SelectMasterClockCandidates: empty input should yield empty output");
+
+    std::printf("PASS: master clock candidate selection (RT-lane filter)\n");
+}
+
 }  // namespace
 
 int main() {
     TestMixMath();
     g_rtAllocViolations.store(0);
     TestRcuStress();
-    std::printf("ALL PASS: engine_graph (mix math + RCU stress)\n");
+    TestMasterClockSelection();
+    std::printf("ALL PASS: engine_graph (mix math + RCU stress + master clock selection)\n");
     return 0;
 }
