@@ -1,4 +1,4 @@
-[CmdletBinding()]
+﻿[CmdletBinding()]
 param(
   [string]$Image = "sluice-engine-build:local",
   [string]$DockerExe
