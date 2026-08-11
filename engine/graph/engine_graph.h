@@ -68,7 +68,10 @@ public:
           buses_(std::move(buses)),
           boundaryRatio_(boundaries_.size(), 1.0),
           boundaryReady_(boundaries_.size(), false),
-          boundaryUnderrun_(boundaries_.size(), false) {}
+          boundaryUnderrun_(boundaries_.size(), false),
+          boundaryRatioForUi_(boundaries_.size()) {
+        for (auto& a : boundaryRatioForUi_) a.store(1.0, std::memory_order_relaxed);
+    }
 
     // マスターコールバックから毎ブロック呼ぶ(実装ガイド §5.4.1)。
     void Process(int frames) {
@@ -96,12 +99,27 @@ public:
 
         for (size_t bi = 0; bi < buses_.size(); ++bi)
             buses_[bi].MixAndWrite(strips_, (int)bi, frames);
+
+        // 制御/IPC スレッドが実装ガイド §5.6「ASRC の現在比」を読めるように、
+        // ready なバウンダリの比だけ atomic へ書く(§4.4 の Phase-0 実装の
+        // ratioForUi パターンを一般化)。プレーンな double をスレッド間で
+        // 共有すると未定義動作になるため、必ずこの atomic 経由で公開する。
+        for (size_t bi = 0; bi < boundaries_.size(); ++bi)
+            if (boundaryReady_[bi])
+                boundaryRatioForUi_[bi].store(boundaryRatio_[bi], std::memory_order_relaxed);
     }
 
     StripRuntime& Strip(size_t i) { return strips_[i]; }
     BusRuntime& Bus(size_t i) { return buses_[i]; }
     size_t StripCount() const { return strips_.size(); }
     size_t BusCount() const { return buses_.size(); }
+    size_t BoundaryCount() const { return boundaries_.size(); }
+
+    // 制御/IPC スレッド専用。あるブロックで無音だった(まだプリフィル待ち)
+    // 場合は直近の値をそのまま返す(UI 表示用の緩い値でよいため)。
+    double BoundaryRatioForUi(size_t i) const {
+        return boundaryRatioForUi_[i].load(std::memory_order_relaxed);
+    }
 
 private:
     std::vector<InputBoundary> boundaries_;
@@ -112,6 +130,7 @@ private:
     std::vector<double> boundaryRatio_;
     std::vector<bool> boundaryReady_;
     std::vector<bool> boundaryUnderrun_;
+    std::vector<std::atomic<double>> boundaryRatioForUi_;
 };
 
 class GraphHandle {

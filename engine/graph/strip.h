@@ -44,9 +44,12 @@ class StripRuntime {
 public:
     // inputRing: このストリップが読む物理/仮想入力のチャンネル(プレーナ)。
     // maxBlockFrames: マスターの最大ブロックフレーム数(起動前に scratch を確保する)。
+    // lane: このストリップが属するデバイスのレーン。ASRC の品質選択に使う
+    // (実装ガイド §4.3.2、engine/dsp/drift.h の AsrcReader 参照)。既定は
+    // Lane::Compat(呼び出し側を変えない既存テストとの後方互換のため)。
     StripRuntime(SpscRing<float>& inputRing, int maxBlockFrames, float sampleRate,
-                const StripParams& initial, int boundaryIndex)
-        : asrc_(inputRing, maxBlockFrames),
+                const StripParams& initial, int boundaryIndex, Lane lane = Lane::Compat)
+        : asrc_(inputRing, maxBlockFrames, lane),
           outBuf_((size_t)maxBlockFrames, 0.0f),
           params_(initial),
           gate_(sampleRate),
