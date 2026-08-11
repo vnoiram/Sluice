@@ -45,8 +45,16 @@ size_t RingCapacityFor(UINT32 periodFrames) {
     return cap;
 }
 
-// KSPROPERTY(GET 用)を組み立てて KsSynchronousDeviceControl で問い合わせる。
+// KSPROPERTY(GET 用)を組み立てて DeviceIoControl で問い合わせる。
 // pinId が -1 ならフィルタ全体向け(素の KSPROPERTY)、それ以外は KSP_PIN。
+//
+// KsSynchronousDeviceControl(<ksproxy.h>、DirectShow の WDM-CSA プロキシ
+// フィルタ向け COM ヘルパー)ではなく素の DeviceIoControl を使う。この
+// クラスは CreateFile で取得した素の HANDLE しか持たず(IKsObject 等の COM
+// プロキシは経由しない)ため、DeviceIoControl の方が自然かつ依存が少ない
+// (ksproxy.h 自体は <winapifamily.h> だけで完結するが、シンボルの実体は
+// ksuser.lib には無く追加のインポートライブラリが要ることが Windows Docker
+// での実ビルドで判明した)。
 bool QueryKsProperty(HANDLE handle, const GUID& set, ULONG id, LONG pinId, void* out,
                       ULONG outSize, ULONG* bytesReturned) {
     if (pinId >= 0) {
@@ -55,15 +63,15 @@ bool QueryKsProperty(HANDLE handle, const GUID& set, ULONG id, LONG pinId, void*
         prop.Property.Id = id;
         prop.Property.Flags = KSPROPERTY_TYPE_GET;
         prop.PinId = (ULONG)pinId;
-        return NtOk(KsSynchronousDeviceControl(handle, IOCTL_KS_PROPERTY, &prop, sizeof(prop),
-                                                out, outSize, bytesReturned));
+        return DeviceIoControl(handle, IOCTL_KS_PROPERTY, &prop, sizeof(prop), out, outSize,
+                               bytesReturned, nullptr) != FALSE;
     }
     KSPROPERTY prop{};
     prop.Set = set;
     prop.Id = id;
     prop.Flags = KSPROPERTY_TYPE_GET;
-    return NtOk(KsSynchronousDeviceControl(handle, IOCTL_KS_PROPERTY, &prop, sizeof(prop), out,
-                                            outSize, bytesReturned));
+    return DeviceIoControl(handle, IOCTL_KS_PROPERTY, &prop, sizeof(prop), out, outSize,
+                           bytesReturned, nullptr) != FALSE;
 }
 
 }  // namespace
@@ -216,13 +224,15 @@ bool KsDevice::FindAndCreatePin(const DeviceStreamConfig& config, std::wstring* 
         prop.Property.Flags = KSPROPERTY_TYPE_GET;
         prop.PinId = pin;
         ULONG neededSize = 0;
-        KsSynchronousDeviceControl(filterHandle_, IOCTL_KS_PROPERTY, &prop, sizeof(prop), nullptr,
-                                    0, &neededSize);
+        // サイズ問い合わせ(out=nullptr)。ERROR_INSUFFICIENT_BUFFER で
+        // 「失敗」するのが正常系のため、戻り値は見ず neededSize だけ使う。
+        DeviceIoControl(filterHandle_, IOCTL_KS_PROPERTY, &prop, sizeof(prop), nullptr, 0,
+                        &neededSize, nullptr);
         if (neededSize == 0) continue;
 
         std::vector<uint8_t> rangesBuf(neededSize);
-        if (!NtOk(KsSynchronousDeviceControl(filterHandle_, IOCTL_KS_PROPERTY, &prop, sizeof(prop),
-                                              rangesBuf.data(), neededSize, &bytesReturned)))
+        if (!DeviceIoControl(filterHandle_, IOCTL_KS_PROPERTY, &prop, sizeof(prop),
+                             rangesBuf.data(), neededSize, &bytesReturned, nullptr))
             continue;
 
         // KSMULTIPLE_ITEM ヘッダの直後に KSDATARANGE(可変長)が Count 個並ぶ。
@@ -316,8 +326,8 @@ bool KsDevice::SetPinState(ULONG state) {
         prop.Flags = KSPROPERTY_TYPE_SET;
         ULONG bytesReturned = 0;
         KSSTATE value = (KSSTATE)target;
-        if (!NtOk(KsSynchronousDeviceControl(pinHandle_, IOCTL_KS_PROPERTY, &prop, sizeof(prop),
-                                              &value, sizeof(value), &bytesReturned)))
+        if (!DeviceIoControl(pinHandle_, IOCTL_KS_PROPERTY, &prop, sizeof(prop), &value,
+                             sizeof(value), &bytesReturned, nullptr))
             return false;
         currentPinState_ = target;
         return true;
