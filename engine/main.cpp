@@ -65,6 +65,7 @@
 #include "graph/master_clock.h"
 #include "ipc/device_report.h"
 #include "ipc/pipe_server.h"
+#include "rt/rt_alloc_guard.h"
 #include "version.h"
 
 namespace {
@@ -389,6 +390,10 @@ std::unique_ptr<MixerState> OpenAndBuild(const std::vector<DeviceSpec>& specs,
 
     MixerState* stPtr = st.get();
     master->SetBlockCallback([stPtr](int frames) {
+        // 実装ガイド §3.2: 開発ビルド(SLUICE_RT_ALLOC_GUARD、CMakeLists.txt
+        // の Debug 構成)ではここから抜けるまでのアロケーションを検出する。
+        // Release ビルドでは RtGuard は空になりオーバーヘッドが無い。
+        rtguard::RtGuard rtGuard;
         EngineGraph* g = stPtr->graphHandle->Acquire();
         if (g) g->Process(frames);
         // vasio ブリッジは自前の RT スレッドを持たないので、マスターの
@@ -920,6 +925,16 @@ int wmain(int argc, wchar_t** argv) {
     for (;;) {
         Sleep(1000);
         std::lock_guard<std::mutex> lock(controlMutex);
+
+        // 実装ガイド §3.2: RT 区間アロケーション検出(Debug 構成のみ有効。
+        // Release では rtguard::Violations() は常に 0)。
+        if (const long long violations = rtguard::Violations(); violations != 0) {
+            fwprintf(stderr,
+                    L"** RT-thread allocation detected: %lld violation(s) since last check "
+                    L"(guide §3.2/§9) **\n",
+                    violations);
+            rtguard::ResetViolations();
+        }
 
         bool anyReset = false;
         for (auto& e : state->devices)

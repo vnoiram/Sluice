@@ -33,6 +33,7 @@ if(BUILD_ASIO_HOST)
         device/process_loopback_device.cpp
         device/ks_device.cpp
         device/vasio_bridge_device.cpp
+        rt/rt_alloc_guard.cpp
         crash/crash_handler.cpp
         sluice-engine.rc
     )
@@ -49,6 +50,11 @@ if(BUILD_ASIO_HOST)
 
     target_compile_definitions(sluice-engine PRIVATE
         NOMINMAX WIN32_LEAN_AND_MEAN UNICODE _UNICODE
+        # 実装ガイド §3.2「開発ビルドでは RT スレッド内アロケーション検出
+        # フックを有効化する」。Debug 構成でのみ engine/rt/rt_alloc_guard.h の
+        # グローバル operator new/delete オーバーライドを有効にする
+        # (Release では完全に無効化され、オーバーヘッドは無い)。
+        $<$<CONFIG:Debug>:SLUICE_RT_ALLOC_GUARD>
     )
 
     if(MSVC)
