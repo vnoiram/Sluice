@@ -282,6 +282,7 @@ DeviceStatus AsioDevice::Status() const {
     s.bufferSizeFrames = bufferSize_;
     s.effectiveLatencySeconds = latencySeconds_;
     s.resetRequested = resetRequested_.load(std::memory_order_relaxed);
+    s.lane = Lane::RT;  // 実装ガイド §4.1.4: ASIO は常に RT Lane
     return s;
 }
 
