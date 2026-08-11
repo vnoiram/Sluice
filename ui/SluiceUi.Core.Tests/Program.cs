@@ -12,6 +12,7 @@ using System.IO.Pipes;
 using System.Text;
 using System.Text.Json.Nodes;
 using SluiceUi.Core;
+using SluiceUi.Core.Models;
 
 static void Fail(string what)
 {
@@ -92,6 +93,102 @@ void TestErrorPropagation()
     Console.WriteLine("PASS: error propagation");
 }
 
+void TestGetDevicesDeserialize()
+{
+    string pipeName = "sluice-ui-test-getdevices-" + Environment.ProcessId;
+    using var ready = new ManualResetEventSlim(false);
+    Task serverTask = Task.Run(() => RunMockServer(pipeName, ready, request =>
+    {
+        var devices = new JsonArray
+        {
+            new JsonObject
+            {
+                ["id"] = "asio:in:Test Driver",
+                ["name"] = "Test Driver",
+                ["backend"] = "asio",
+                ["direction"] = "capture",
+                ["lane"] = "rt",
+                ["recommendedLane"] = "rt",
+                ["effectiveLatencyMs"] = 1.33,
+                ["bufferSizeFrames"] = 64,
+                ["callbackCount"] = 100,
+                ["underrunCount"] = 0,
+                ["overrunCount"] = 1,
+                ["xrunCount"] = 1,
+                ["resetRequested"] = false,
+                ["asrcRatio"] = 1.0000132,
+                ["supports64"] = true,
+            },
+        };
+        return new JsonObject
+        {
+            ["id"] = request["id"]!.DeepClone(),
+            ["result"] = devices,
+        };
+    }));
+    ready.Wait();
+
+    using var client = new EngineClient(pipeName);
+    List<DeviceInfo> devices = client.GetDevices();
+    serverTask.Wait();
+
+    if (devices.Count != 1) Fail($"get_devices: expected 1 device, got {devices.Count}");
+    DeviceInfo d = devices[0];
+    if (d.Id != "asio:in:Test Driver") Fail($"get_devices: unexpected id '{d.Id}'");
+    if (d.Lane != "rt") Fail($"get_devices: unexpected lane '{d.Lane}'");
+    if (d.XrunCount != 1) Fail($"get_devices: unexpected xrunCount {d.XrunCount}");
+    if (Math.Abs(d.AsrcRatio - 1.0000132) > 1e-9) Fail($"get_devices: unexpected asrcRatio {d.AsrcRatio}");
+
+    Console.WriteLine("PASS: get_devices deserialize");
+}
+
+void TestDevicesChangedPushNotification()
+{
+    // get_devices とは異なり、push 通知はリクエストなしにサーバから
+    // 能動的に送られてくる(engine/ipc/pipe_server.h の Notify())。
+    // このテストのモックサーバは接続後、応答を待たず即座に event 行を書く。
+    string pipeName = "sluice-ui-test-push-" + Environment.ProcessId;
+    using var ready = new ManualResetEventSlim(false);
+    Task serverTask = Task.Run(() =>
+    {
+        using var server = new NamedPipeServerStream(pipeName, PipeDirection.InOut, 1);
+        ready.Set();
+        server.WaitForConnection();
+
+        using var writer = new StreamWriter(server, new UTF8Encoding(false), leaveOpen: true)
+        {
+            AutoFlush = true,
+            NewLine = "\n",
+        };
+        var evt = new JsonObject
+        {
+            ["event"] = "devices_changed",
+            ["data"] = new JsonArray
+            {
+                new JsonObject { ["id"] = "x", ["name"] = "X", ["lane"] = "compat" },
+            },
+        };
+        writer.WriteLine(evt.ToJsonString());
+    });
+    ready.Wait();
+
+    using var client = new EngineClient(pipeName);
+    var tcs = new TaskCompletionSource<List<DeviceInfo>>();
+    client.DevicesChanged += devices => tcs.TrySetResult(devices);
+
+    if (!tcs.Task.Wait(TimeSpan.FromSeconds(5)))
+        Fail("devices_changed push notification: timed out waiting for event");
+
+    List<DeviceInfo> received = tcs.Task.Result;
+    if (received.Count != 1 || received[0].Id != "x")
+        Fail($"devices_changed push notification: unexpected payload ({received.Count} items)");
+
+    serverTask.Wait();
+    Console.WriteLine("PASS: devices_changed push notification");
+}
+
 TestEchoRoundTrip();
 TestErrorPropagation();
+TestGetDevicesDeserialize();
+TestDevicesChangedPushNotification();
 Console.WriteLine("ALL PASS: SluiceUi.Core (EngineClient)");

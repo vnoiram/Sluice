@@ -1,12 +1,14 @@
 <Window x:Class="SluiceUi.MainWindow"
         xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
         xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
-        Title="Sluice" Height="280" Width="440"
+        Title="Sluice" Height="480" Width="720"
         WindowStartupLocation="CenterScreen">
     <Grid Margin="12">
         <Grid.RowDefinitions>
             <RowDefinition Height="Auto"/>
             <RowDefinition Height="Auto"/>
+            <RowDefinition Height="Auto"/>
+            <RowDefinition Height="2*"/>
             <RowDefinition Height="*"/>
         </Grid.RowDefinitions>
 
@@ -16,7 +18,24 @@
         <Button x:Name="ConnectButton" Grid.Row="1" Content="Connect"
                 Click="ConnectButton_Click" Width="100" HorizontalAlignment="Left"/>
 
-        <TextBox x:Name="LogBox" Grid.Row="2" Margin="0,8,0,0"
+        <!-- デバイス一覧(実装ガイド §5.6「UI に必ず出すもの: 各デバイスの
+             レーン、実効レイテンシ、xrun カウンタ、ASRC の現在比」)。
+             engine からの push 通知(devices_changed)を受けて自動更新する。 -->
+        <DataGrid x:Name="DevicesGrid" Grid.Row="3" Margin="0,8,0,0"
+                  AutoGenerateColumns="False" IsReadOnly="True"
+                  CanUserAddRows="False" HeadersVisibility="Column">
+            <DataGrid.Columns>
+                <DataGridTextColumn Header="Name" Binding="{Binding Name}" Width="2*"/>
+                <DataGridTextColumn Header="Backend" Binding="{Binding Backend}" Width="*"/>
+                <DataGridTextColumn Header="Dir" Binding="{Binding Direction}" Width="*"/>
+                <DataGridTextColumn Header="Lane" Binding="{Binding Lane}" Width="*"/>
+                <DataGridTextColumn Header="Latency (ms)" Binding="{Binding EffectiveLatencyMs, StringFormat=F2}" Width="*"/>
+                <DataGridTextColumn Header="xrun" Binding="{Binding XrunCount}" Width="*"/>
+                <DataGridTextColumn Header="ASRC ratio" Binding="{Binding AsrcRatio, StringFormat=F7}" Width="1.3*"/>
+            </DataGrid.Columns>
+        </DataGrid>
+
+        <TextBox x:Name="LogBox" Grid.Row="4" Margin="0,8,0,0"
                  IsReadOnly="True" VerticalScrollBarVisibility="Auto"
                  TextWrapping="Wrap" FontFamily="Consolas"/>
     </Grid>
