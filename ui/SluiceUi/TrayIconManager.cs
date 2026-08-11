@@ -1,4 +1,4 @@
-// TrayIconManager.cs : システムトレイ常駐(実装ガイド §5.7)
+// TrayIconManager.cs : システムトレイ常駐(実装ガイド §5.6)
 //
 // WPF に標準のトレイアイコン API が無いため、System.Windows.Forms の
 // NotifyIcon を使う(WPF アプリでの一般的なやり方。UseWindowsForms を
@@ -27,7 +27,7 @@ public sealed class TrayIconManager : IDisposable
 
         _icon = new NotifyIcon
         {
-            // TODO: 専用アイコンに差し替える(実装ガイド §10 の商標表記と
+            // TODO: 専用アイコンに差し替える(実装ガイド §12 の商標表記と
             // あわせてブランディング確定時に対応)。
             Icon = SystemIcons.Application,
             Visible = true,

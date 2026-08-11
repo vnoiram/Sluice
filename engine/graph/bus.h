@@ -1,5 +1,5 @@
 #pragma once
-// bus.h : 出力バス(実装ガイド §5.4.1 / §5.4.2)
+// bus.h : 出力バス(実装ガイド §5.4 / §5.4.1)
 //
 // 各ストリップの出力を routingGain で重み付けして N×M ミックスし、
 // バスゲイン → リミッタ(実装ガイド §5.5)を適用してから、1 つ以上の
@@ -37,7 +37,7 @@ public:
 
     // 全ストリップを busIndex 番目のセンドゲインで重み付けしてミックスし、
     // バスゲイン→リミッタを適用してから出力リングへ書き込む
-    // (実装ガイド §5.4.2 の N×M ミックスループ + §5.5 のバス用リミッタ)。
+    // (実装ガイド §5.4.1 の N×M ミックスループ + §5.5 のバス用リミッタ)。
     void MixAndWrite(const std::vector<StripRuntime>& strips, int busIndex, int frames) {
         std::fill(mixBuf_.begin(), mixBuf_.begin() + frames, 0.0f);
         for (const auto& s : strips) {

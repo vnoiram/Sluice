@@ -8,7 +8,7 @@
 // パススルーで書いていたロジックの一般化)。
 //
 // EngineGraph: 1 つのトポロジ(ストリップ/バス構成)。トポロジ変更
-// (ストリップ追加等)は丸ごと作り直す(実装ガイド §5.4.4)。
+// (ストリップ追加等)は丸ごと作り直す(実装ガイド §5.4.3)。
 //
 // GraphHandle: RCU 方式のグラフ差し替え。
 //   1. 制御スレッドが新しい EngineGraph を構築
@@ -70,7 +70,7 @@ public:
           boundaryReady_(boundaries_.size(), false),
           boundaryUnderrun_(boundaries_.size(), false) {}
 
-    // マスターコールバックから毎ブロック呼ぶ(実装ガイド §5.4.2)。
+    // マスターコールバックから毎ブロック呼ぶ(実装ガイド §5.4.1)。
     void Process(int frames) {
         for (size_t i = 0; i < boundaries_.size(); ++i)
             boundaryReady_[i] = boundaries_[i].UpdateAndGetRatio(&boundaryRatio_[i]);

@@ -66,7 +66,7 @@ void WriteDump(EXCEPTION_POINTERS* info) {
     CloseHandle(file);
 }
 
-// Vectored Exception Handler(実装ガイド §5.8 のクラッシュダンプ収集)。
+// Vectored Exception Handler(実装ガイド §5.7 のクラッシュダンプ収集)。
 // SetUnhandledExceptionFilter よりも早い段階(SEH フレームベースの
 // __try/__except より前)で呼ばれるため、より確実にダンプを取得できる。
 // EXCEPTION_CONTINUE_SEARCH を返し、例外そのものは消費しない(あとで

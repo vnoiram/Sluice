@@ -1,5 +1,6 @@
 # ローカル専用の設計資料。社外秘/個人メモを含みうるため commit しない。
 /docs/
+/audio-router-guide-v3.md
 
 # Claude Code のセッション/権限設定(ローカル環境依存)
 /.claude/

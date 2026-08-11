@@ -6,7 +6,7 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 # BUILD_ASIO_HOST: 実機 ASIO パススルー(sluice-engine.exe)。ASIO SDK(Steinberg, 非再配布)が要る。
 # BUILD_TESTS    : プラットフォーム非依存のコア(リング/ASRC/ドリフト)の回帰テスト。
-#                  ASIO SDK なしでもここは常にビルドできる(実装ガイド §8)。
+#                  ASIO SDK なしでもここは常にビルドできる(実装ガイド §10)。
 option(BUILD_ASIO_HOST "Build the ASIO passthrough executable (requires ASIO SDK)" ON)
 option(BUILD_TESTS "Build core regression tests (ring buffer, ASRC/drift)" ON)
 

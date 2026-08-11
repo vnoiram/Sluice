@@ -1,11 +1,11 @@
 #pragma once
-// strip.h : 入力ストリップ(実装ガイド §5.4.1)
+// strip.h : 入力ストリップ(実装ガイド §5.4)
 //
 // 1 StripRuntime = 1 モノラルチャンネル分の入力パス。ステレオ入力は
 // 2 つの StripRuntime(例: "Mic L"/"Mic R")として扱う(ステレオ連結/
 // リンク操作は今後の課題。ミニマム実装の意図的な割り切り)。
 //
-// 処理順(実装ガイド §5.4.2): ASRC(クロックドリフト吸収)→ gain(ミュート/
+// 処理順(実装ガイド §5.4.1): ASRC(クロックドリフト吸収)→ gain(ミュート/
 // ソロ込み、ブロック内線形補間)→ gate → EQ → comp → メータリング。
 
 #include <algorithm>
@@ -23,7 +23,7 @@
 
 // UI から更新されるパラメータ(トリプルバッファでスナップショットされる)。
 // ヒープ確保を伴うメンバを持たないこと(RT 側のコピーが RT 安全である
-// ため)。routingGain は本来 std::vector(実装ガイド §5.4.1)だが、
+// ため)。routingGain は本来 std::vector(実装ガイド §5.4)だが、
 // コピー時のアロケーションを避けるため固定長 std::array にしている。
 struct StripParams {
     static constexpr int kMaxBuses = 64;
@@ -57,7 +57,7 @@ public:
     }
 
     // ブロック先頭で呼ぶ。ASRC 経由で frames フレーム取得し、
-    // gain → gate → EQ → comp を適用する(実装ガイド §5.4.2)。
+    // gain → gate → EQ → comp を適用する(実装ガイド §5.4.1)。
     // 戻り値: このブロックでアンダーランが発生したか(呼び出し側は該当
     // InputBoundary の再プリフィルに使う)。
     bool Process(int frames, double srcRatio, bool anySolo) {
@@ -106,7 +106,7 @@ private:
         const bool audible = !p.mute && (!anySolo || p.solo);
         const float target = audible ? DbToLinear(p.gainDb) : 0.0f;
         // ブロック内で smoothedGainLin_ → target へ線形補間しながら適用
-        // (実装ガイド §5.4.3: ゲイン変化はブロック内で線形補間、ザッピング
+        // (実装ガイド §5.4.2: ゲイン変化はブロック内で線形補間、ザッピング
         // ノイズ防止)。
         for (int i = 0; i < frames; ++i) {
             const float t = (float)(i + 1) / (float)frames;

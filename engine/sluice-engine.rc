@@ -1,5 +1,5 @@
 // sluice-engine.rc : sluice-engine.exe の Win32 バージョンリソース
-// (実装ガイド §5.8)。engine/version.h と数値を一致させること。
+// (実装ガイド §5.7)。engine/version.h と数値を一致させること。
 
 #include <winres.h>
 

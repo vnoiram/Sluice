@@ -1,5 +1,5 @@
 #pragma once
-// crash_handler.h : クラッシュダンプ収集(実装ガイド §5.8)
+// crash_handler.h : クラッシュダンプ収集(実装ガイド §5.7)
 //
 // 「クラッシュダンプ収集(MiniDumpWriteDump)とバージョン情報を最初から
 // 入れておく」に対応。アプリ起動時に Install() を一度呼ぶだけでよい。
