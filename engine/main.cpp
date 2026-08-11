@@ -4,7 +4,7 @@
 // データフロー(実装ガイド §4.4 / §5.1 の IAudioDevice 契約に準拠):
 //   A: OnBufferSwitch が各チャンネルの CaptureRing へ書く(デバイス内部で完結)
 //   B: OnBufferSwitch が RenderRing を読み出す「前」に blockCallback が発火
-//      する(実装ガイド §5.4.2 の「マスターコールバック」に相当)。
+//      する(実装ガイド §5.4.1 の「マスターコールバック」に相当)。
 //      この blockCallback の中で、このファイル(エンジン)が A の
 //      CaptureRing から ASRC 経由で 1 ブロック分読み出し、B の
 //      RenderRing へ書き込む。ASRC/ドリフト補正はデバイス側ではなく
@@ -28,6 +28,8 @@
 #include "crash/crash_handler.h"
 #include "device/asio_host.h"
 #include "dsp/drift.h"
+#include "ipc/device_report.h"
+#include "ipc/pipe_server.h"
 #include "rt/spsc_ring.h"
 #include "version.h"
 
@@ -58,11 +60,23 @@ void PrintDrivers(const std::vector<DriverInfo>& list) {
         wprintf(L"  [%zu] %s\n", i, list[i].name.c_str());
 }
 
+// engine/ipc/device_report.h は Windows API 非依存を保つため UTF-8
+// std::string のみを扱う(オフライン単体テストを可能にするため)。
+// wstring→UTF-8 変換はこの Windows 専用ファイル側の責務にする。
+std::string WideToUtf8(const std::wstring& w) {
+    if (w.empty()) return {};
+    const int len =
+        WideCharToMultiByte(CP_UTF8, 0, w.c_str(), (int)w.size(), nullptr, 0, nullptr, nullptr);
+    std::string out((size_t)len, '\0');
+    WideCharToMultiByte(CP_UTF8, 0, w.c_str(), (int)w.size(), out.data(), len, nullptr, nullptr);
+    return out;
+}
+
 } // namespace
 
 int wmain(int argc, wchar_t** argv) {
     // 起動直後、他の何より先にクラッシュダンプ収集を有効化する
-    // (実装ガイド §5.8)。
+    // (実装ガイド §5.7)。
     crashhandler::Install();
     wprintf(L"sluice-engine %s\n", version::kStringW);
 
@@ -126,7 +140,9 @@ retry_open:
     Pipeline p;
     p.asrc.reserve(kChannels);
     for (int c = 0; c < kChannels; ++c)
-        p.asrc.push_back(std::make_unique<AsrcReader>(*devIn.CaptureRing(c), outBuf));
+        // A/B とも ASIO(常に RT Lane、実装ガイド §4.1.4)なので
+        // SRC_SINC_FASTEST を使う(実装ガイド §4.3.2)。
+        p.asrc.push_back(std::make_unique<AsrcReader>(*devIn.CaptureRing(c), outBuf, Lane::RT));
     p.scratch.resize((size_t)outBuf);
 
     // --- B(出力)側 = マスタークロック。RenderRing 読み出し直前に発火する
@@ -162,12 +178,39 @@ retry_open:
         }
     });
 
+    // --- IPC(名前付きパイプ、実装ガイド §5.6)------------------------------
+    // main.cpp の Phase-0 デバイス(devIn/devOut)に PipeServer を配線する。
+    // JSON スキーマはデバイスの配列にしておき(固定 A/B ペア決め打ちに
+    // しない)、将来 EngineGraph に統合されても破壊的変更にならないように
+    // する。UI に必ず出すべきもの(実装ガイド §5.6): レーン・実効
+    // レイテンシ・xrun カウンタ・ASRC の現在比。
+    auto buildDevicesArray = [&]() {
+        std::vector<JsonValue> reports;
+        const double ratio = p.ratioForUi.load(std::memory_order_relaxed);
+        const std::string inName = WideToUtf8(drivers[(size_t)inIdx].name);
+        const std::string outName = WideToUtf8(drivers[(size_t)outIdx].name);
+        reports.push_back(ipc::DeviceReportToJson("asio:in:" + inName, inName, "asio",
+                                                  /*isCapture=*/true, devIn.Status(),
+                                                  devIn.Probe(kSampleRate), ratio));
+        reports.push_back(ipc::DeviceReportToJson("asio:out:" + outName, outName, "asio",
+                                                  /*isCapture=*/false, devOut.Status(),
+                                                  devOut.Probe(kSampleRate), ratio));
+        return ipc::DeviceReportsToJsonArray(reports);
+    };
+
+    ipc::PipeServer pipeServer(L"\\\\.\\pipe\\sluice-engine");
+    // echo は既存 UI(ui/SluiceUi/MainWindow.xaml.cs)が使うため維持する。
+    pipeServer.RegisterMethod("echo", [](const JsonValue& params) { return params; });
+    pipeServer.RegisterMethod("get_devices",
+                              [&](const JsonValue&) { return buildDevicesArray(); });
+    pipeServer.Start();
+
     // --- 開始 --------------------------------------------------------------
     devIn.Start();
     devOut.Start();
     wprintf(L"running. Press Ctrl+C to stop.\n");
 
-    // --- 監視ループ(1 秒ごとに統計、リセット要求を処理)-------------------
+    // --- 監視ループ(1 秒ごとに統計・push 通知、リセット要求を処理)---------
     for (;;) {
         Sleep(1000);
         const DeviceStatus inStatus = devIn.Status();
@@ -180,8 +223,17 @@ retry_open:
                 (unsigned long long)inStatus.callbackCount,
                 (unsigned long long)outStatus.callbackCount);
 
+        // push 通知(実装ガイド §5.6)。PipeServer::Notify() はロック+ヒープ
+        // 確保を伴うため、RT スレッドではなくこの監視ループ(制御スレッド)
+        // から呼ぶ。
+        JsonValue event = JsonValue::MakeObject();
+        event["event"] = std::string("devices_changed");
+        event["data"] = buildDevicesArray();
+        pipeServer.Notify(event);
+
         if (inStatus.resetRequested || outStatus.resetRequested) {
             wprintf(L"** kAsioResetRequest: rebuilding devices **\n");
+            pipeServer.Stop();
             devIn.Close();
             devOut.Close();
             goto retry_open;   // PoC の最単純対応: 全体作り直し
