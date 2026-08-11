@@ -1,0 +1,75 @@
+# CI(実装ガイド §9.2 の SignPath Foundation 申請前提「CI(GitHub Actions等)
+# でのビルド」を満たすために追加)。
+#
+# ASIO SDK は Steinberg のライセンス上リポジトリにもこの CI にも置けない
+# ため、engine/vasio 両方の CMakeLists.txt が自動フォールバックする
+# BUILD_ASIO_HOST=OFF / BUILD_VASIO_DRIVER=OFF の経路で動く。つまり
+# sluice-engine.exe 本体・vasio.dll 本体は CI ではビルドされず、
+# プラットフォーム非依存のコアテスト・WASAPI/KS/vasio ブリッジのコンパイル
+# 確認・tools/latencybench・tools/devprobe・UI(.NET)のみを検証する
+# (engine/README.md・vasio/README.md の「検証状況」節と同じ制約)。
+#
+# 各ジョブは Windows Docker 経由のローカル開発スクリプト
+# (scripts/build-*-in-windows-docker.ps1)が最終的に呼ぶのと同じ
+# engine/scripts/run-tests.ps1・vasio/scripts/run-build.ps1・
+# ui/scripts/run-tests.ps1 を、windows-latest ランナー上で直接(Docker層を
+# 挟まずに)呼び出す。ランナーは Windows Server ベースで Visual Studio 2022
+# Build Tools・vcpkg(VCPKG_INSTALLATION_ROOT)が既定でプリインストールされて
+# いる前提(GitHub がドキュメント化している windows-latest イメージの仕様)。
+#
+# 注意: このワークフローは Windows GitHub-hosted ランナー上での実行で
+# 検証されていない(この開発環境が WSL/Linux のため)。初回実行時に
+# ランナーイメージの差異(VS のバージョン、vcpkg の既定 triplet 等)で
+# 調整が必要になる可能性がある。
+
+name: CI
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  engine:
+    name: engine core tests + tools/latencybench + tools/devprobe
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install libsamplerate (vcpkg)
+        shell: pwsh
+        run: |
+          & "$env:VCPKG_INSTALLATION_ROOT\vcpkg.exe" install libsamplerate:x64-windows-static-md
+
+      - name: Configure, build, test
+        shell: pwsh
+        run: |
+          $env:VCPKG_ROOT = $env:VCPKG_INSTALLATION_ROOT
+          .\engine\scripts\run-tests.ps1
+
+  vasio:
+    name: vasio shared-memory protocol
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure, build, test
+        shell: pwsh
+        run: |
+          .\vasio\scripts\run-build.ps1
+
+  ui:
+    name: SluiceUi (.NET)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: "8.0.x"
+
+      - name: Build and test
+        shell: pwsh
+        run: |
+          .\ui\scripts\run-tests.ps1
