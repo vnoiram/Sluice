@@ -1,0 +1,10 @@
+; vasio.def : COM DLL エクスポート定義(実装ガイド §8.1)
+; DllMain は名前が一致していれば MSVC が自動的にエントリポイントとして採用するため
+; ここには列挙しない。regsvr32 / DAW のホスト実装が GetProcAddress で探す
+; 4 つの COM 標準エントリポイントのみを列挙する。
+LIBRARY vasio
+EXPORTS
+    DllGetClassObject   PRIVATE
+    DllCanUnloadNow     PRIVATE
+    DllRegisterServer   PRIVATE
+    DllUnregisterServer PRIVATE
