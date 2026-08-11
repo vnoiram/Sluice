@@ -7,9 +7,8 @@
 //     ユーザーモード COM DLL。DAW は CoCreateInstance でこれを生成し、
 //     IASIO インターフェース越しに呼び出す(engine/device/asio_host.h が
 //     「ホスト側」から他社ドライバを呼ぶのと対称の、逆方向の実装)。
-//   - IASIO は IUnknown 以外 __thiscall の非標準 COM。ASIO SDK 付属の
-//     combase.h/.cpp(CUnknown/CFactoryTemplate)がこの COM ボイラープレートを
-//     提供してくれるので自作しない(driver/asiosample/asiosmpl.cpp が実例)。
+//   - IASIO/COM ボイラープレートは ASIO SDK を使わず asio-abi/(リポジトリ
+//     直下)の独自実装を使う。asio-abi/README.md 参照。
 //   - createBuffers() で渡される bufferSize は「エンジンが今動いている
 //     ブロックサイズ」と一致するとは限らない。DAW 側が要求したサイズを
 //     そのまま受け入れ、エンジン側のブロックサイズとの差はエンジン境界の
@@ -27,9 +26,8 @@
 // 既定 8in/8out(kMaxChannels、shared_protocol.h)。マルチインスタンス(複数
 // CLSID を跨いだ同時起動)は将来課題。
 
-#include "asiosys.h"
-#include "combase.h"
-#include "iasiodrv.h"
+#include "../asio-abi/asio_abi.h"
+#include "../asio-abi/com_server.h"
 
 #include <windows.h>
 
@@ -42,19 +40,26 @@
 // {A1B2C3D4-1234-4E56-8F9A-0123456789AB} : Sluice vasio 固有の CLSID。
 // 実装ガイド §12「プロジェクト名は... 衝突確認してから確定する」に対応する
 // 正式な値ではなく、開発用の仮 CLSID。製品化前に必ず新規採番すること。
-// driver/asiosample/asiosmpl.cpp の IID_ASIO_DRIVER と同じ流儀(素の CLSID 定数、
-// DEFINE_GUID マクロは使わない — INITGUID の定義漏れによるリンクエラーを避ける)。
+// 素の CLSID 定数として定義する(DEFINE_GUID マクロは使わない — INITGUID の
+// 定義漏れによるリンクエラーを避けるため)。
 extern CLSID CLSID_SluiceVasio;
 
-class SluiceVasioDriver : public IASIO, public CUnknown {
+class SluiceVasioDriver : public IASIO, public comserver::RefCounted {
 public:
-    SluiceVasioDriver(LPUNKNOWN pUnk, HRESULT* phr);
-    ~SluiceVasioDriver();
+    SluiceVasioDriver();
+    ~SluiceVasioDriver() override;
 
-    DECLARE_IUNKNOWN
+    // IUnknown(IASIO 経由で継承)。QueryInterface は ASIO 特有の「標準の
+    // IID ではなくドライバ自身の CLSID と比較する」作法で実装する
+    // (asio-abi/README.md 参照)。AddRef/Release は RefCounted に委譲する
+    // だけでよい(参照カウントの計算そのものに ASIO 固有の事情は無い)。
+    STDMETHODIMP QueryInterface(REFIID riid, void** ppvObject) override;
+    STDMETHODIMP_(ULONG) AddRef() override { return DoAddRef(); }
+    STDMETHODIMP_(ULONG) Release() override { return DoRelease(); }
 
-    static CUnknown* CreateInstance(LPUNKNOWN pUnk, HRESULT* phr);
-    virtual HRESULT STDMETHODCALLTYPE NonDelegatingQueryInterface(REFIID riid, void** ppvObject);
+    // comserver::SingleClassFactory::CreateInstanceFn に渡す生成関数
+    // (asio-abi/com_server.h 参照、集約非対応なので引数を取らない)。
+    static IUnknown* CreateInstance();
 
     // --- IASIO --------------------------------------------------------
     ASIOBool init(void* sysHandle) override;

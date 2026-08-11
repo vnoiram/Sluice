@@ -1,92 +1,108 @@
 // vasio_driver.cpp : 仮想 ASIO ドライバ本体の実装(実装ガイド §8.1)
 //
-// driver/asiosample/asiosmpl.cpp(Steinberg 提供のサンプルドライバ)を土台にした
-// 構成。異なるのは「テスト波形を生成する」代わりに「共有メモリ越しに engine
-// プロセスとデータを交換する」点のみ。COM ボイラープレート(CFactoryTemplate,
-// CClassFactory, DllGetClassObject/DllCanUnloadNow/DllEntryPoint)は ASIO SDK の
-// common/dllentry.cpp + common/combase.cpp をそのままリンクして使う
-// (engine/CMakeLists.txt が SDK の .cpp を一切使わないホスト側とは対照的に、
-// ドライバ側はこの SDK 提供の COM ヘルパー抜きでは書けない)。
+// driver/asiosample/asiosmpl.cpp(Steinberg 提供のサンプルドライバ、当初の
+// 実装時に構成の参考にした)と同じ役回りだが、ASIO SDK は使わない。
+// 「テスト波形を生成する」代わりに「共有メモリ越しに engine プロセスと
+// データを交換する」のが本質的な違い。COM ボイラープレート
+// (単一 CLSID 用クラスファクトリ、DllGetClassObject/DllCanUnloadNow)は
+// asio-abi/com_server.h の独自実装を使う。asio-abi/README.md 参照。
 
 #include "vasio_driver.h"
 
 #include <cstdio>
 #include <cstring>
 
+#include "../asio-abi/asio_registry.h"
+
 // ===========================================================================
-// CLSID 登録テーブル / ファクトリ(driver/asiosample/asiosmpl.cpp と同じ形)
+// CLSID / COM エントリポイント
 // ===========================================================================
 
 // {A1B2C3D4-1234-4E56-8F9A-0123456789AB}(開発用の仮 CLSID。vasio_driver.h 参照)
 CLSID CLSID_SluiceVasio = {
     0xa1b2c3d4, 0x1234, 0x4e56, {0x8f, 0x9a, 0x01, 0x23, 0x45, 0x67, 0x89, 0xab}};
 
-CFactoryTemplate g_Templates[1] = {
-    {L"Sluice Virtual ASIO", &CLSID_SluiceVasio, SluiceVasioDriver::CreateInstance}};
-int g_cTemplates = sizeof(g_Templates) / sizeof(g_Templates[0]);
+IUnknown* SluiceVasioDriver::CreateInstance() { return new SluiceVasioDriver(); }
 
-CUnknown* SluiceVasioDriver::CreateInstance(LPUNKNOWN pUnk, HRESULT* phr) {
-    return static_cast<CUnknown*>(new SluiceVasioDriver(pUnk, phr));
+STDMETHODIMP SluiceVasioDriver::QueryInterface(REFIID riid, void** ppv) {
+    if (!ppv) return E_POINTER;
+    // ASIO の作法: 標準の IID ではなく、ドライバ自身の CLSID を IID として
+    // 比較する(asio-abi/README.md、driver/asiosample/asiosmpl.cpp の前例と
+    // 同じ非標準の慣習)。加えて素の IUnknown 問い合わせにも応答しておく
+    // (一般的な COM クライアントからの同一性比較に対応するため)。
+    if (riid == CLSID_SluiceVasio || riid == IID_IUnknown) {
+        *ppv = static_cast<IASIO*>(this);
+        AddRef();
+        return S_OK;
+    }
+    *ppv = nullptr;
+    return E_NOINTERFACE;
 }
 
-HRESULT STDMETHODCALLTYPE SluiceVasioDriver::NonDelegatingQueryInterface(REFIID riid, void** ppv) {
-    if (riid == CLSID_SluiceVasio) {
-        return GetInterface(static_cast<IASIO*>(this), ppv);
+extern "C" HRESULT __stdcall DllGetClassObject(REFCLSID rclsid, REFIID riid, void** ppv) {
+    return comserver::DllGetClassObjectImpl(rclsid, CLSID_SluiceVasio, riid, ppv,
+                                            &SluiceVasioDriver::CreateInstance);
+}
+
+extern "C" HRESULT __stdcall DllCanUnloadNow() { return comserver::DllCanUnloadNowImpl(); }
+
+// この DLL 自身のモジュールハンドル。DllRegisterServer が
+// InProcServer32 に書き込む DLL パスを取得するために使う
+// (GetModuleFileNameW に nullptr を渡すと「現在のプロセスの実行ファイル」の
+// パスが返ってしまい、DAW にロードされた vasio.dll 自身のパスにはならない)。
+HINSTANCE g_hinstDll = nullptr;
+
+extern "C" BOOL WINAPI DllMain(HINSTANCE hinstDLL, ULONG reason, LPVOID) {
+    if (reason == DLL_PROCESS_ATTACH) {
+        g_hinstDll = hinstDLL;
+        DisableThreadLibraryCalls(hinstDLL);
     }
-    return CUnknown::NonDelegatingQueryInterface(riid, ppv);
+    return TRUE;
 }
 
 // ===========================================================================
 // COM 登録/解除(実装ガイド §8.1 手順2)
 //   HKCR\CLSID\{...}\InProcServer32 と HKLM\SOFTWARE\ASIO\<name> の両方を
-//   ASIO SDK 付属の RegisterAsioDriver/UnregisterAsioDriver(common/register.cpp)
-//   に任せる。DLL 名・表示名はここでしか出てこないので、ビルド成果物の実際の
+//   asio-abi/asio_registry.h の RegisterAsioDriver/UnregisterAsioDriver に
+//   任せる。DLL 名・表示名はここでしか出てこないので、ビルド成果物の実際の
 //   ファイル名(vasio.dll)と一致させること。
 // ===========================================================================
 
-extern "C" LONG RegisterAsioDriver(CLSID, char*, char*, char*, char*);
-extern "C" LONG UnregisterAsioDriver(CLSID, char*, char*);
-
 extern "C" HRESULT __stdcall DllRegisterServer() {
-    LONG rc = RegisterAsioDriver(CLSID_SluiceVasio, const_cast<char*>("vasio.dll"),
-                                  const_cast<char*>("Sluice Virtual ASIO"),
-                                  const_cast<char*>("Sluice Virtual ASIO"),
-                                  const_cast<char*>("Apartment"));
-    if (rc) {
-        char msg[128];
-        std::snprintf(msg, sizeof(msg), "Register Server failed! (%ld)", rc);
-        MessageBoxA(nullptr, msg, "Sluice Virtual ASIO", MB_OK);
+    wchar_t modulePath[MAX_PATH]{};
+    // hinstDLL はこの DLL 自身のモジュールハンドル。nullptr を渡すと
+    // GetModuleFileNameW は「現在のプロセスの実行ファイル」を返してしまう
+    // ため、必ず DllMain で受け取ったハンドル相当(g_hinstDll)を使うこと。
+    GetModuleFileNameW(g_hinstDll, modulePath, MAX_PATH);
+
+    const long rc = asioabi::RegisterAsioDriver(CLSID_SluiceVasio, modulePath,
+                                                L"Sluice Virtual ASIO", L"Sluice Virtual ASIO");
+    if (rc != ERROR_SUCCESS) {
+        wchar_t msg[128];
+        swprintf_s(msg, L"Register Server failed! (%ld)", rc);
+        MessageBoxW(nullptr, msg, L"Sluice Virtual ASIO", MB_OK);
         return E_FAIL;
     }
     return S_OK;
 }
 
 extern "C" HRESULT __stdcall DllUnregisterServer() {
-    LONG rc = UnregisterAsioDriver(CLSID_SluiceVasio, const_cast<char*>("vasio.dll"),
-                                    const_cast<char*>("Sluice Virtual ASIO"));
-    if (rc) {
-        char msg[128];
-        std::snprintf(msg, sizeof(msg), "Unregister Server failed! (%ld)", rc);
-        MessageBoxA(nullptr, msg, "Sluice Virtual ASIO", MB_OK);
+    const long rc =
+        asioabi::UnregisterAsioDriver(CLSID_SluiceVasio, L"Sluice Virtual ASIO");
+    if (rc != ERROR_SUCCESS) {
+        wchar_t msg[128];
+        swprintf_s(msg, L"Unregister Server failed! (%ld)", rc);
+        MessageBoxW(nullptr, msg, L"Sluice Virtual ASIO", MB_OK);
         return E_FAIL;
     }
     return S_OK;
-}
-
-// common/dllentry.cpp は DLL_PROCESS_ATTACH/DETACH のフックとして
-// DllEntryPoint(DllMain ではない)を定義している。MSVC の DLL エントリポイントは
-// 名前が正確に DllMain のものを自動的に採用するため、ここで単純に転送する。
-extern "C" BOOL WINAPI DllEntryPoint(HINSTANCE, ULONG, LPVOID);
-extern "C" BOOL WINAPI DllMain(HINSTANCE hInst, ULONG reason, LPVOID reserved) {
-    return DllEntryPoint(hInst, reason, reserved);
 }
 
 // ===========================================================================
 // 構築/破棄
 // ===========================================================================
 
-SluiceVasioDriver::SluiceVasioDriver(LPUNKNOWN pUnk, HRESULT* phr)
-    : CUnknown(const_cast<TCHAR*>(TEXT("SluiceVasio")), pUnk, phr) {
+SluiceVasioDriver::SluiceVasioDriver() {
     stopEvent_ = CreateEventW(nullptr, TRUE, FALSE, nullptr);
 }
 
