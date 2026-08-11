@@ -12,6 +12,7 @@
 //     何もオープンされていなければ null チェックで即 return するため安全)。
 
 #include "device/process_loopback_device.h"
+#include "device/vac.h"
 #include "device/vb_cable.h"
 #include "device/wasapi_device.h"
 
@@ -20,6 +21,8 @@ int main() {
     (void)enumerateFn;
     auto detectVbCableFn = &wasapi::DetectVbCable;
     (void)detectVbCableFn;
+    auto detectVacFn = &wasapi::DetectVac;
+    (void)detectVacFn;
 
     wasapi::ProcessLoopbackDevice device(/*targetPid=*/0, /*includeChildren=*/true);
     (void)device;
