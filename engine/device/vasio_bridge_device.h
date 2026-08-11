@@ -57,7 +57,12 @@ namespace vasiobridge {
 
 class VasioBridgeDevice : public IAudioDevice {
 public:
-    VasioBridgeDevice() = default;
+    // instanceId: gap 11 の複数インスタンス対応。既定 "0" は導入前の固定
+    // 命名と完全に後方互換。main.cpp の --vasio-instance で明示指定できる
+    // (vasio.dll 側は環境変数 SLUICE_VASIO_INSTANCE で同じ instanceId を
+    // 指定する必要がある、vasio/vasio_driver.cpp 参照)。
+    explicit VasioBridgeDevice(std::wstring instanceId = L"0")
+        : instanceId_(std::move(instanceId)) {}
     ~VasioBridgeDevice() override { Close(); }
     VasioBridgeDevice(const VasioBridgeDevice&) = delete;
 
@@ -111,6 +116,7 @@ public:
 private:
     bool ConnectSharedMemory(std::wstring* errorOut);
 
+    std::wstring instanceId_;
     HANDLE mapping_ = nullptr;
     void* mappedBase_ = nullptr;
     HANDLE readyEvent_ = nullptr;

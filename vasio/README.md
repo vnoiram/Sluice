@@ -52,8 +52,8 @@ regsvr32 build\Release\vasio.dll
   `scripts/build-vasio-x86-in-windows-docker.ps1`(`-A Win32` で configure
   するだけ)で行える。64bit 版と 32bit 版は別々の CLSID/レジストリキーを
   共有する設計ではない点に注意(同じ `CLSID_SluiceVasio` を両方に登録して
-  問題ないが、同時に両方の DAW から接続する複数インスタンス対応は別課題、
-  下記参照)。
+  問題ないが、64bit 版と 32bit 版を同時に別々の instanceId で使う場合は
+  各プロセス側で `SLUICE_VASIO_INSTANCE` を正しく設定すること、下記参照)。
 - 登録解除は `regsvr32 /u build\Release\vasio.dll`。
 
 ## CLSID について
@@ -76,14 +76,21 @@ regsvr32 build\Release\vasio.dll
 コーディングしてある)正しく接続する。Windows 実機・実 DAW での接続確認は
 未実施(`engine/README.md` の既知の簡略化を参照)。
 
-- マッピング名 `Local\SluiceVasio.0`、準備完了イベント名
-  `Local\SluiceVasioReady.0`(いずれも `vasio::MappingName()`/
-  `vasio::ReadyEventName()`)
+- マッピング名 `Local\SluiceVasio.<instanceId>`、準備完了イベント名
+  `Local\SluiceVasioReady.<instanceId>`(いずれも `vasio::MappingName()`/
+  `vasio::ReadyEventName()`、既定 instanceId は `"0"`)
 - 方向は「ToEngine」(DAW→エンジン)/「FromEngine」(エンジン→DAW)で命名し、
   `engine/device/vb_cable.h` にあるような「入力/出力」の命名反転による混乱を
   避けている
-- 既定 8in/8out 固定、単一インスタンスのみ(複数 CLSID を跨いだ同時起動は
-  将来課題)
+- 既定 8in/8out 固定
+- gap 11: **複数インスタンス対応**。1 つの `sluice-engine.exe` プロセスで
+  `--vasio --vasio-instance <id>` を複数回指定すると、instanceId ごとに
+  別々の共有メモリ/イベントで独立した vasio ブリッジを開ける。DAW 側
+  (`vasio.dll` がロードされるプロセス)は環境変数 `SLUICE_VASIO_INSTANCE`
+  に同じ `<id>` を設定してから起動する必要がある(vasio.dll 自体は CLI
+  引数を持たないため)。`<id>` を指定しない場合は両者とも既定の `"0"` を
+  使い、これは複数インスタンス対応導入前の固定名と完全に一致する
+  (後方互換)。Windows 実機・複数 DAW プロセスでの実接続確認は未実施。
 
 ## 既知の簡略化(このフェーズの意図的な割り切り)
 

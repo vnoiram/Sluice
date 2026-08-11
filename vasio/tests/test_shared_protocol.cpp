@@ -84,11 +84,25 @@ static void TestRingBackpressure() {
     CHECK(read == kCap);  // 実際に書かれた分しか読めない
 }
 
+// gap 11: 複数インスタンス対応。既定引数("0")が導入前の固定名と一致し
+// (後方互換)、異なる instanceId は異なる名前になることを確認する。
+static void TestInstanceNaming() {
+    CHECK(vasio::MappingName() == L"Local\\SluiceVasio.0");
+    CHECK(vasio::ReadyEventName() == L"Local\\SluiceVasioReady.0");
+    CHECK(vasio::MappingName(L"0") == vasio::MappingName());
+    CHECK(vasio::ReadyEventName(L"0") == vasio::ReadyEventName());
+
+    CHECK(vasio::MappingName(L"1") == L"Local\\SluiceVasio.1");
+    CHECK(vasio::ReadyEventName(L"1") == L"Local\\SluiceVasioReady.1");
+    CHECK(vasio::MappingName(L"1") != vasio::MappingName(L"2"));
+}
+
 int main() {
     TestLayoutSizes();
     TestRingRoundTrip();
     TestRingWrapAround();
     TestRingBackpressure();
+    TestInstanceNaming();
     std::printf("test_shared_protocol: OK\n");
     return 0;
 }

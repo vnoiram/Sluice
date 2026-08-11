@@ -156,6 +156,7 @@ struct DeviceSpec {
     std::wstring displayName;   // 明示的な表示名(空なら列挙結果の名前を使う)
     DWORD pid = 0;               // loopback 用
     std::string backendLabel;   // 表示上の backend 名を上書きしたい場合("vbcable"/"vac")
+    std::wstring vasioInstanceId = L"0";  // gap 11: vasio 用。--vasio-instance 参照
 };
 
 // ===========================================================================
@@ -327,9 +328,13 @@ bool OpenOneDevice(const DeviceSpec& spec, const std::vector<asiohost::DriverInf
     case DeviceSpec::Backend::Vasio: {
         // vasio.dll(仮想 ASIO ドライバ)との共有メモリ接続。DAW→エンジンの
         // capture 方向と エンジン→DAW の render 方向を同時に提供する
-        // (実装ガイド §8.1)。singleton 前提(instanceId 固定 "0")なので
-        // spec.index/endpointId は参照しない。
-        auto dev = std::make_unique<vasiobridge::VasioBridgeDevice>();
+        // (実装ガイド §8.1)。spec.index/endpointId は参照しない。
+        // gap 11: instanceId は既定 "0"(単一インスタンス運用、導入前と
+        // 完全に後方互換)。複数インスタンスを使う場合は --vasio-instance
+        // で明示し、対応する DAW プロセス側は環境変数
+        // SLUICE_VASIO_INSTANCE に同じ値を設定しておく必要がある
+        // (vasio/vasio_driver.cpp 参照)。
+        auto dev = std::make_unique<vasiobridge::VasioBridgeDevice>(spec.vasioInstanceId);
         if (!dev->Open(config, errorOut)) return false;
         outEntry->name = "vasio (virtual ASIO bridge)";
         outEntry->backend = "vasio";
@@ -777,6 +782,9 @@ int wmain(int argc, wchar_t** argv) {
     auto nextInt = [&](int i, int def) -> int {
         return (i + 1 < argc) ? _wtoi(argv[i + 1]) : def;
     };
+    auto nextWStr = [&](int i, const std::wstring& def) -> std::wstring {
+        return (i + 1 < argc) ? std::wstring(argv[i + 1]) : def;
+    };
 
     for (int i = 1; i < argc; ++i) {
         const std::wstring a = argv[i];
@@ -823,11 +831,23 @@ int wmain(int argc, wchar_t** argv) {
             ++i;
             specs.push_back(s);
         } else if (a == L"--vasio") {
-            // vasio.dll(vasio/vasio_driver.cpp)との共有メモリブリッジ。
-            // 単一インスタンス前提なので index/pid は無い(実装ガイド §8.1)。
+            // vasio.dll(vasio/vasio_driver.cpp)との共有メモリブリッジ
+            // (実装ガイド §8.1)。index/pid は無い。
             DeviceSpec s;
             s.backend = DeviceSpec::Backend::Vasio;
             specs.push_back(s);
+        } else if (a == L"--vasio-instance") {
+            // gap 11: 直前の --vasio に instanceId を割り当てる(複数
+            // インスタンス対応。既定は "0"、対応する DAW プロセス側は
+            // 環境変数 SLUICE_VASIO_INSTANCE に同じ値を設定する必要が
+            // ある、vasio/vasio_driver.cpp 参照)。
+            const std::wstring instanceId = nextWStr(i, L"0");
+            ++i;
+            if (specs.empty() || specs.back().backend != DeviceSpec::Backend::Vasio) {
+                fwprintf(stderr, L"--vasio-instance must directly follow --vasio\n");
+                return 1;
+            }
+            specs.back().vasioInstanceId = instanceId;
         } else if (a == L"--vbcable-in" || a == L"--vbcable-out") {
             const bool wantIn = (a == L"--vbcable-in");
             auto eps = wasapi::DetectVbCable();

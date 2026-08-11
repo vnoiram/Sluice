@@ -14,6 +14,23 @@
 
 #include "../asio-abi/asio_registry.h"
 
+namespace {
+
+// gap 11: 複数インスタンス対応。vasio.dll は DAW プロセス内にロードされ
+// CLI 引数を持たないため、instanceId は環境変数から読む(engine 側は
+// main.cpp の --vasio-instance で明示指定する、vasio_bridge_device.cpp
+// 参照)。未設定なら既定の "0"(導入前の固定名と完全に後方互換)。
+// DAW を起動する側が SLUICE_VASIO_INSTANCE を設定して、複数の DAW
+// プロセスをそれぞれ別の engine 側インスタンスへ振り分ける想定。
+std::wstring ResolveInstanceIdFromEnvironment() {
+    wchar_t buf[64] = {};
+    const DWORD len = GetEnvironmentVariableW(L"SLUICE_VASIO_INSTANCE", buf, 64);
+    if (len == 0 || len >= 64) return L"0";
+    return buf;
+}
+
+}  // namespace
+
 // ===========================================================================
 // CLSID / COM エントリポイント
 // ===========================================================================
@@ -129,8 +146,10 @@ bool SluiceVasioDriver::ConnectSharedMemory() {
     constexpr uint32_t kRingCapacityFrames = vasio::kDefaultRingCapacityFrames;
     layout_ = vasio::ComputeLayout(kRingCapacityFrames);
 
+    const std::wstring instanceId = ResolveInstanceIdFromEnvironment();
     mapping_ = CreateFileMappingW(INVALID_HANDLE_VALUE, nullptr, PAGE_READWRITE, 0,
-                                   static_cast<DWORD>(layout_.totalBytes), vasio::MappingName());
+                                   static_cast<DWORD>(layout_.totalBytes),
+                                   vasio::MappingName(instanceId).c_str());
     if (!mapping_) return false;
 
     mappedView_ = MapViewOfFile(mapping_, FILE_MAP_ALL_ACCESS, 0, 0, layout_.totalBytes);
@@ -140,7 +159,7 @@ bool SluiceVasioDriver::ConnectSharedMemory() {
         return false;
     }
 
-    readyEvent_ = CreateEventW(nullptr, FALSE, FALSE, vasio::ReadyEventName());
+    readyEvent_ = CreateEventW(nullptr, FALSE, FALSE, vasio::ReadyEventName(instanceId).c_str());
     if (!readyEvent_) {
         UnmapViewOfFile(mappedView_);
         mappedView_ = nullptr;

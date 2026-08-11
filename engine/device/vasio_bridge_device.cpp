@@ -19,7 +19,8 @@ bool VasioBridgeDevice::ConnectSharedMemory(std::wstring* errorOut) {
     layout_ = vasio::ComputeLayout(vasio::kDefaultRingCapacityFrames);
 
     mapping_ = CreateFileMappingW(INVALID_HANDLE_VALUE, nullptr, PAGE_READWRITE, 0,
-                                  static_cast<DWORD>(layout_.totalBytes), vasio::MappingName());
+                                  static_cast<DWORD>(layout_.totalBytes),
+                                  vasio::MappingName(instanceId_).c_str());
     if (!mapping_) {
         if (errorOut) *errorOut = L"CreateFileMapping(vasio shared memory) failed";
         return false;
@@ -39,7 +40,7 @@ bool VasioBridgeDevice::ConnectSharedMemory(std::wstring* errorOut) {
     }
 
     readyEvent_ = CreateEventW(nullptr, /*bManualReset=*/FALSE, /*bInitialState=*/FALSE,
-                               vasio::ReadyEventName());
+                               vasio::ReadyEventName(instanceId_).c_str());
     if (!readyEvent_) {
         if (errorOut) *errorOut = L"CreateEvent(vasio ready event) failed";
         UnmapViewOfFile(mappedBase_);

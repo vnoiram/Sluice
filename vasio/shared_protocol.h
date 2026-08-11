@@ -41,6 +41,7 @@
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
+#include <string>
 
 namespace vasio {
 
@@ -123,8 +124,18 @@ constexpr SharedMemoryLayout ComputeLayout(uint32_t ringCapacityFrames) {
     return layout;
 }
 
-inline const wchar_t* MappingName() { return L"Local\\SluiceVasio.0"; }
-inline const wchar_t* ReadyEventName() { return L"Local\\SluiceVasioReady.0"; }
+// gap 11: 複数インスタンス対応。instanceId ごとに一意な名前を返す。
+// 既定値 "0" は導入前の固定名(L"...SluiceVasio.0" 等)と完全に一致するため、
+// instanceId を明示しない既存の呼び出し側(単一インスタンス運用)の挙動は
+// 変わらない。instanceId の解決方法自体(vasio.dll 側は環境変数、engine 側
+// は CLI 引数)はこのファイルの関知するところではない(Windows API 非依存を
+// 保つため、呼び出し側の Windows 専用ファイルの責務にする)。
+inline std::wstring MappingName(const std::wstring& instanceId = L"0") {
+    return L"Local\\SluiceVasio." + instanceId;
+}
+inline std::wstring ReadyEventName(const std::wstring& instanceId = L"0") {
+    return L"Local\\SluiceVasioReady." + instanceId;
+}
 
 // ---------------------------------------------------------------------------
 // SPSC リング読み書き(1 チャンネルぶん)
