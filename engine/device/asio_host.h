@@ -26,10 +26,10 @@
 //   多いが、専用の隠しウィンドウが要るドライバもある)。
 //   kAsioResetRequest を受けたら RT 外で作り直す必要がある。
 //
-// 罠 4: 「WIN32_LEAN_AND_MEAN と ASIO SDK の相性」
+// 罠 4: 「WIN32_LEAN_AND_MEAN と COM ヘッダの相性」
 //   <windows.h> を WIN32_LEAN_AND_MEAN 付きでインクルードすると
 //   <objbase.h>(COM の基礎: IUnknown, CoCreateInstance, CLSIDFromString
-//   等)が自動では入らない。ASIO SDK の iasiodrv.h は IASIO : public
+//   等)が自動では入らない。asio-abi/asio_abi.h の IASIO は IASIO : public
 //   IUnknown を素朴に前提にしているため、objbase.h を明示的に先に
 //   インクルードしておかないと「IASIO redefinition」等の意味不明な
 //   構文エラーの連鎖になる(実際に踏んだ)。
@@ -46,7 +46,7 @@
 #include <vector>
 
 #include "device/iaudio_device.h"
-#include "iasiodrv.h"   // ASIO SDK (thirdparty/asiosdk/common)
+#include "../../asio-abi/asio_abi.h"   // 独自 ABI 実装(ASIO SDK 不要、asio-abi/README.md 参照)
 #include "rt/spsc_ring.h"
 
 namespace asiohost {

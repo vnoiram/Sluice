@@ -4,24 +4,19 @@ project(sluice-engine CXX)
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
-# BUILD_ASIO_HOST: 実機 ASIO パススルー(sluice-engine.exe)。ASIO SDK(Steinberg, 非再配布)が要る。
+# BUILD_ASIO_HOST: 実機 ASIO パススルー(sluice-engine.exe)。ASIO SDK は不要
+#                  (asio-abi/ の独自 ABI 実装を使う。asio-abi/README.md 参照)。
+#                  COM/Windows API 前提なので Windows 以外では自動的に OFF。
 # BUILD_TESTS    : プラットフォーム非依存のコア(リング/ASRC/ドリフト)の回帰テスト。
-#                  ASIO SDK なしでもここは常にビルドできる(実装ガイド §10)。
-option(BUILD_ASIO_HOST "Build the ASIO passthrough executable (requires ASIO SDK)" ON)
+#                  Windows 以外でもここは常にビルドできる(実装ガイド §10)。
+option(BUILD_ASIO_HOST "Build the ASIO passthrough executable (Windows only)" ON)
 option(BUILD_TESTS "Build core regression tests (ring buffer, ASRC/drift)" ON)
 
 find_package(SampleRate CONFIG REQUIRED)  # vcpkg: libsamplerate
 find_package(Threads REQUIRED)
 
-# --- ASIO SDK -----------------------------------------------------------
-# SDK は各自 Steinberg からダウンロードし thirdparty/asiosdk に配置する。
-# ここではヘッダ(iasiodrv.h, asio.h 系)のみ参照し、SDK の .cpp は使わない。
-set(ASIOSDK_DIR "${CMAKE_SOURCE_DIR}/thirdparty/asiosdk")
-
-if(BUILD_ASIO_HOST AND NOT EXISTS "${ASIOSDK_DIR}/common/iasiodrv.h")
-    message(WARNING
-        "ASIO SDK not found (expected ${ASIOSDK_DIR}/common/iasiodrv.h). "
-        "Skipping sluice-engine.exe target; core regression tests still build. See README.md")
+if(BUILD_ASIO_HOST AND NOT WIN32)
+    message(WARNING "sluice-engine.exe requires Windows (COM/WASAPI/KS). Skipping on this platform.")
     set(BUILD_ASIO_HOST OFF)
 endif()
 
@@ -39,7 +34,6 @@ if(BUILD_ASIO_HOST)
     )
 
     target_include_directories(sluice-engine PRIVATE
-        "${ASIOSDK_DIR}/common"
         "${CMAKE_SOURCE_DIR}"
     )
 
