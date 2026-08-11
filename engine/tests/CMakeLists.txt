@@ -132,6 +132,21 @@ if(WIN32)
         target_compile_options(test_ks_compile PRIVATE /W4 /permissive-)
     endif()
     # 意図的に add_test() しない(上記コメント参照)。
+
+    # vasio ブリッジ(engine/device/vasio_bridge_device.h、実装ガイド §8.1)の
+    # コンパイル/リンク確認。DAW/vasio.dll のロードは無い環境なので、
+    # test_ks_compile と同じく構築/破棄だけを確認し add_test() はしない。
+    add_executable(test_vasio_bridge_compile
+        test_vasio_bridge_compile.cpp
+        ${CMAKE_SOURCE_DIR}/device/vasio_bridge_device.cpp
+    )
+    target_include_directories(test_vasio_bridge_compile PRIVATE ${CMAKE_SOURCE_DIR})
+    target_compile_definitions(test_vasio_bridge_compile PRIVATE
+        NOMINMAX WIN32_LEAN_AND_MEAN UNICODE _UNICODE
+    )
+    if(MSVC)
+        target_compile_options(test_vasio_bridge_compile PRIVATE /W4 /permissive-)
+    endif()
 endif()
 
 # クラッシュダンプ収集(engine/crash/crash_handler.h)の実結合テスト
