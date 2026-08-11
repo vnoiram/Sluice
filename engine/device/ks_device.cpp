@@ -11,6 +11,14 @@
 
 #include "device/ks_device.h"
 
+// <ks.h> は IOCTL_KS_PROPERTY 等を組み立てるのに CTL_CODE/FILE_DEVICE_KS/
+// METHOD_NEITHER/FILE_ANY_ACCESS を使うが、これらの基礎マクロ自体は
+// <winioctl.h> 側にあり <ks.h> は自動で引き込んでくれない(<windows.h> も
+// 既定では <winioctl.h> を含まない)。先に明示的にインクルードしておかないと
+// 「CTL_CODE: identifier not found」等のリンク以前のコンパイルエラーになる
+// (Windows Docker での実ビルドで判明)。
+#include <winioctl.h>
+
 // KSCATEGORY_AUDIO 等の GUID は DEFINE_GUIDSTRUCT マクロで宣言されており、
 // INITGUID なしだと「宣言のみ」で未解決シンボルになる。wasapi_device.cpp の
 // functiondiscoverykeys_devpkey.h と同じ理由でこのファイル内だけ実体を持たせる。
