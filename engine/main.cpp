@@ -1,19 +1,24 @@
 // main.cpp : EngineGraph ベースのミキサー(実装ガイド M1: エンジン統合)
 //
 // Phase 0(ASIO 1対1パススルー)を置き換え、複数デバイス種別(ASIO/WASAPI/
-// DirectKS/プロセスループバック/VB-CABLE/VAC)を同時に開き、
-// graph/engine_graph.h の EngineGraph(ストリップ/バス/N×M ルーティング/
-// RCU グラフ差し替え)へ実際に配線する。
+// DirectKS/プロセスループバック/VB-CABLE/VAC/vasio 仮想 ASIO ブリッジ)を
+// 同時に開き、graph/engine_graph.h の EngineGraph(ストリップ/バス/N×M
+// ルーティング/RCU グラフ差し替え)へ実際に配線する。
 //
 // アーキテクチャ(実装ガイド §2.2〜§2.4 に対応):
 //   - 各デバイスは自分の RT スレッドで自分のチャンネルごとの SpscRing に
-//     読み書きするだけ(device/iaudio_device.h の契約どおり)。
+//     読み書きするだけ(device/iaudio_device.h の契約どおり)。例外は vasio
+//     ブリッジ(device/vasio_bridge_device.h)で、専用スレッドを持たず
+//     マスターの blockCallback から明示的に PumpSharedMemory() される
+//     (実装ガイド §8.1「仮想 ASIO のクロックはエンジンに従属する」)。
 //   - マスタークロックに選ばれた 1 台だけが SetBlockCallback を登録する。
 //     そのコールバックの中で EngineGraph::Process(frames) を呼ぶことが、
 //     全ストリップの ASRC 読み出し・全バスの N×M ミックス・全出力リングへの
 //     書き込みをまとめて駆動する(§5.4.1 の「マスターコールバック」)。
 //     他のデバイスは自分のリングを読み書きするだけで、コールバック登録は
-//     不要(engine/device/iaudio_device.h のコメント参照)。
+//     不要(engine/device/iaudio_device.h のコメント参照)。vasio ブリッジは
+//     常にこの「他のデバイス」側であり、マスターの候補にはならない
+//     (自身の独立したクロックを持たないため)。
 //   - マスタークロックは master_clock.h により RT Lane のデバイスから選ぶ
 //     (§2.3)。RT Lane が 1 台も無い場合は先頭のデバイスにフォールバックし、
 //     警告を出す(全滅よりはまし、という割り切り)。
@@ -30,7 +35,9 @@
 //   - マスタークロック以外の出力デバイスはドリフト補正されない
 //     (InputBoundary/ASRC は入力側にしか無い)。複数の出力デバイスを使う
 //     構成では、マスター以外の出力デバイスのクロックがずれると長時間で
-//     xrun しうる。対称な「出力バウンダリ」の実装は将来課題。
+//     xrun しうる。対称な「出力バウンダリ」の実装は将来課題(vasio ブリッジは
+//     マスターに従属する設計上そもそも独立クロックを持たないため、この
+//     制約の対象外)。
 //   - EQ/ゲート/コンプ/リミッタの set_param 経由での調整は対応しているが、
 //     どの値が「良い」かは呼び出し側の責務(バリデーションは最小限)。
 
@@ -51,6 +58,7 @@
 #include "device/ks_device.h"
 #include "device/process_loopback_device.h"
 #include "device/vac.h"
+#include "device/vasio_bridge_device.h"
 #include "device/vb_cable.h"
 #include "device/wasapi_device.h"
 #include "graph/engine_graph.h"
@@ -87,7 +95,7 @@ std::wstring Utf8ToWide(const std::string& s) {
 // デバイス構成(CLI から組み立てる「起動時に何を開くか」の指定)
 // ===========================================================================
 struct DeviceSpec {
-    enum class Backend { Asio, Wasapi, Ks, Loopback } backend = Backend::Wasapi;
+    enum class Backend { Asio, Wasapi, Ks, Loopback, Vasio } backend = Backend::Wasapi;
     bool isCapture = true;
     int index = -1;             // asio ドライバ index / ks device index(--list 参照)
     std::wstring endpointId;    // wasapi: 明示的なエンドポイント ID(VB-CABLE/VAC 自動検出用)
@@ -99,11 +107,15 @@ struct DeviceSpec {
 // ===========================================================================
 // 開いたデバイス 1 台分
 // ===========================================================================
+// isCapture のような単一方向フラグは持たない。ASIO/WASAPI/KS/
+// プロセスループバックは片方向しか実装しない(CaptureRing/RenderRing の
+// 片方が常に nullptr を返す)が、vasio ブリッジ(device/vasio_bridge_device.h)
+// は両方向を同時に提供する。実際にどちらの方向を持つかは常に
+// ProbeChannelCount() で判定する(下記)。
 struct DeviceEntry {
     std::unique_ptr<IAudioDevice> device;
     std::string backend;
     std::string name;   // UTF-8
-    bool isCapture = true;
 };
 
 int ProbeChannelCount(IAudioDevice* dev, bool isCapture) {
@@ -140,6 +152,11 @@ struct MixerState {
     EngineGraph* controlGraph = nullptr;  // 直近に Publish() した生ポインタ(制御スレッド専用)
     IAudioDevice* masterDevice = nullptr;
     int maxBlockFrames = 64;
+
+    // vasio ブリッジ(devices 内にも通常どおり存在する)への型付きアクセス。
+    // PumpSharedMemory() は IAudioDevice の一般契約に無いメソッドなので、
+    // master の blockCallback から呼ぶために別途保持する(実装ガイド §8.1)。
+    std::vector<vasiobridge::VasioBridgeDevice*> vasioBridges;
 };
 
 // EngineGraph を現在のトポロジ指定から丸ごと作り直し、RCU 差し替えする
@@ -193,7 +210,6 @@ bool OpenOneDevice(const DeviceSpec& spec, const std::vector<asiohost::DriverInf
         if (!dev->Open(config, errorOut)) return false;
         outEntry->name = WideToUtf8(asioDrivers[(size_t)spec.index].name);
         outEntry->backend = "asio";
-        outEntry->isCapture = spec.isCapture;
         outEntry->device = std::move(dev);
         return true;
     }
@@ -213,7 +229,6 @@ bool OpenOneDevice(const DeviceSpec& spec, const std::vector<asiohost::DriverInf
         if (!dev->Open(config, errorOut)) return false;
         outEntry->name = displayName.empty() ? "WASAPI" : WideToUtf8(displayName);
         outEntry->backend = spec.backendLabel.empty() ? "wasapi" : spec.backendLabel;
-        outEntry->isCapture = spec.isCapture;
         outEntry->device = std::move(dev);
         return true;
     }
@@ -227,7 +242,6 @@ bool OpenOneDevice(const DeviceSpec& spec, const std::vector<asiohost::DriverInf
         if (!dev->Open(config, errorOut)) return false;
         outEntry->name = WideToUtf8(ksDevices[(size_t)spec.index].friendlyName);
         outEntry->backend = "ks";
-        outEntry->isCapture = spec.isCapture;
         outEntry->device = std::move(dev);
         return true;
     }
@@ -237,7 +251,18 @@ bool OpenOneDevice(const DeviceSpec& spec, const std::vector<asiohost::DriverInf
         if (!dev->Open(config, errorOut)) return false;
         outEntry->name = "PID " + std::to_string(spec.pid);
         outEntry->backend = "process_loopback";
-        outEntry->isCapture = true;
+        outEntry->device = std::move(dev);
+        return true;
+    }
+    case DeviceSpec::Backend::Vasio: {
+        // vasio.dll(仮想 ASIO ドライバ)との共有メモリ接続。DAW→エンジンの
+        // capture 方向と エンジン→DAW の render 方向を同時に提供する
+        // (実装ガイド §8.1)。singleton 前提(instanceId 固定 "0")なので
+        // spec.index/endpointId は参照しない。
+        auto dev = std::make_unique<vasiobridge::VasioBridgeDevice>();
+        if (!dev->Open(config, errorOut)) return false;
+        outEntry->name = "vasio (virtual ASIO bridge)";
+        outEntry->backend = "vasio";
         outEntry->device = std::move(dev);
         return true;
     }
@@ -261,24 +286,27 @@ std::unique_ptr<MixerState> OpenAndBuild(const std::vector<DeviceSpec>& specs,
             for (auto& e : st->devices) e.device->Close();
             return nullptr;
         }
+        // vasio ブリッジは PumpSharedMemory() という IAudioDevice の一般契約に
+        // 無いメソッドを持つため、型付きの参照も別途保持しておく(devices には
+        // 通常どおり IAudioDevice* として入る)。
+        if (auto* bridge = dynamic_cast<vasiobridge::VasioBridgeDevice*>(entry.device.get()))
+            st->vasioBridges.push_back(bridge);
         st->devices.push_back(std::move(entry));
     }
 
-    // 境界: チャンネル数が 1 以上のキャプチャデバイス 1 台につき 1 つ
+    // 境界: チャンネル数が 1 以上のキャプチャ方向を持つデバイス 1 台につき 1 つ
     // (実装ガイド §5.4「InputBoundary」)。RebuildEngineGraph は境界の
     // 代表チャンネルとして CaptureRing(0) を無条件に参照するため、
     // チャンネル 0 が存在しないデバイス(想定外だが理論上あり得る)を
     // 境界に加えるとクラッシュする。ここで弾いておく。
-    // ストリップ: (キャプチャデバイス, チャンネル) の組ごとに 1 つ。
+    // ストリップ: (キャプチャ方向を持つデバイス, チャンネル) の組ごとに 1 つ。
+    // ASIO/WASAPI/KS/プロセスループバックは片方向のみ実装するため
+    // ProbeChannelCount は自動的に 0 を返す(isCapture フラグでの分岐は
+    // 不要。vasio ブリッジのように両方向を同時に持つデバイスも自然に扱える)。
     for (size_t i = 0; i < st->devices.size(); ++i) {
-        if (!st->devices[i].isCapture) continue;
         IAudioDevice* dev = st->devices[i].device.get();
         const int channels = ProbeChannelCount(dev, /*isCapture=*/true);
-        if (channels <= 0) {
-            wprintf(L"warning: capture device %zu (\"%s\") reports 0 channels; skipping\n", i,
-                    Utf8ToWide(st->devices[i].name).c_str());
-            continue;
-        }
+        if (channels <= 0) continue;
         BoundarySpec b;
         b.deviceIndex = (int)i;
         const int boundaryIndex = (int)st->boundaries.size();
@@ -292,9 +320,9 @@ std::unique_ptr<MixerState> OpenAndBuild(const std::vector<DeviceSpec>& specs,
         }
     }
 
-    // バス: (レンダーデバイス, チャンネル) の組ごとに 1 つ(ストリップと対称)。
+    // バス: (レンダー方向を持つデバイス, チャンネル) の組ごとに 1 つ
+    // (ストリップと対称)。
     for (size_t di = 0; di < st->devices.size(); ++di) {
-        if (st->devices[di].isCapture) continue;
         IAudioDevice* dev = st->devices[di].device.get();
         const int channels = ProbeChannelCount(dev, /*isCapture=*/false);
         for (int ch = 0; ch < channels; ++ch) {
@@ -321,31 +349,35 @@ std::unique_ptr<MixerState> OpenAndBuild(const std::vector<DeviceSpec>& specs,
 
     // マスタークロック選定(実装ガイド §2.3): RT Lane のデバイスから選ぶ。
     // 出力デバイスを優先する(§5.4.1 の「マスターコールバック」は本来
-    // RenderRing 読み出し直前に発火するもので、出力側が自然)。
+    // RenderRing 読み出し直前に発火するもので、出力側が自然)。vasio ブリッジ
+    // は Lane::RT を報告するが**候補から除外する**: vasio 自身は独立した
+    // クロックを持たず「エンジンのマスタークロックに従属する」設計
+    // (実装ガイド §8.1 手順4)なので、それ自身をマスターに選ぶと駆動元が
+    // 無くなり循環する。
     std::vector<IAudioDevice*> allPtrs;
     allPtrs.reserve(st->devices.size());
-    for (auto& e : st->devices) allPtrs.push_back(e.device.get());
+    for (auto& e : st->devices) {
+        if (dynamic_cast<vasiobridge::VasioBridgeDevice*>(e.device.get())) continue;
+        allPtrs.push_back(e.device.get());
+    }
     const std::vector<IAudioDevice*> rtCandidates = engine::SelectMasterClockCandidates(allPtrs);
 
     IAudioDevice* master = nullptr;
     for (IAudioDevice* d : rtCandidates) {
-        for (auto& e : st->devices) {
-            if (e.device.get() == d && !e.isCapture) {
-                master = d;
-                break;
-            }
+        if (ProbeChannelCount(d, /*isCapture=*/false) > 0) {
+            master = d;
+            break;
         }
-        if (master) break;
     }
     if (!master && !rtCandidates.empty()) master = rtCandidates.front();
-    if (!master && !st->devices.empty()) {
+    if (!master && !allPtrs.empty()) {
         wprintf(L"warning: no RT-lane device available; falling back to the first opened "
                 L"device as master clock (guide %s: latency/robustness will suffer)\n",
                 L"§2.3");
-        master = st->devices.front().device.get();
+        master = allPtrs.front();
     }
     if (!master) {
-        *errorOut = L"no devices available to act as master clock";
+        *errorOut = L"no non-vasio devices available to act as master clock";
         for (auto& e : st->devices) e.device->Close();
         return nullptr;
     }
@@ -359,6 +391,11 @@ std::unique_ptr<MixerState> OpenAndBuild(const std::vector<DeviceSpec>& specs,
     master->SetBlockCallback([stPtr](int frames) {
         EngineGraph* g = stPtr->graphHandle->Acquire();
         if (g) g->Process(frames);
+        // vasio ブリッジは自前の RT スレッドを持たないので、マスターの
+        // ブロックごとに明示的にポンプする(実装ガイド §8.1 手順4)。
+        // graph->Process() の**後**に呼ぶことで、このブロックで
+        // BusRuntime が書いたばかりの FromEngine データを送り出せる。
+        for (auto* bridge : stPtr->vasioBridges) bridge->PumpSharedMemory(frames);
     });
     st->masterDevice = master;
 
@@ -466,22 +503,42 @@ JsonValue BuildDevicesJson(const MixerState& st) {
     reports.reserve(st.devices.size());
     for (size_t i = 0; i < st.devices.size(); ++i) {
         const DeviceEntry& e = st.devices[i];
-        double ratio = 1.0;  // レンダーデバイスには ASRC が無いので既定 1.0(既知の簡略化)
-        if (st.controlGraph && e.isCapture) {
-            for (size_t bi = 0; bi < st.boundaries.size(); ++bi) {
-                if (st.boundaries[bi].deviceIndex == (int)i) {
-                    ratio = st.controlGraph->BoundaryRatioForUi(bi);
-                    break;
+        const DeviceStatus status = e.device->Status();
+        const DeviceCaps caps = e.device->Probe(kSampleRate);
+        const bool isMaster = (e.device.get() == st.masterDevice);
+
+        // 片方向デバイス(ASIO/WASAPI/KS/プロセスループバック)はどちらか
+        // 一方だけ、vasio ブリッジのように両方向を持つデバイスは 2 件
+        // (in と out)報告する。id は "backend:方向:devices[]のindex"。
+        const bool hasCapture = ProbeChannelCount(e.device.get(), /*isCapture=*/true) > 0;
+        const bool hasRender = ProbeChannelCount(e.device.get(), /*isCapture=*/false) > 0;
+
+        if (hasCapture) {
+            double ratio = 1.0;
+            if (st.controlGraph) {
+                for (size_t bi = 0; bi < st.boundaries.size(); ++bi) {
+                    if (st.boundaries[bi].deviceIndex == (int)i) {
+                        ratio = st.controlGraph->BoundaryRatioForUi(bi);
+                        break;
+                    }
                 }
             }
+            const std::string id = e.backend + ":in:" + std::to_string(i);
+            JsonValue report = ipc::DeviceReportToJson(id, e.name, e.backend.c_str(),
+                                                       /*isCapture=*/true, status, caps, ratio);
+            report["isMasterClock"] = isMaster;
+            reports.push_back(report);
         }
-        const std::string id = e.backend + ":" + (e.isCapture ? "in" : "out") + ":" +
-                               std::to_string(i);
-        JsonValue report = ipc::DeviceReportToJson(id, e.name, e.backend.c_str(), e.isCapture,
-                                                   e.device->Status(),
-                                                   e.device->Probe(kSampleRate), ratio);
-        report["isMasterClock"] = (e.device.get() == st.masterDevice);
-        reports.push_back(report);
+        if (hasRender) {
+            // レンダー方向には ASRC が無いので既定 1.0(main.cpp 冒頭コメントの
+            // 既知の簡略化を参照)。
+            const std::string id = e.backend + ":out:" + std::to_string(i);
+            JsonValue report = ipc::DeviceReportToJson(id, e.name, e.backend.c_str(),
+                                                       /*isCapture=*/false, status, caps,
+                                                       /*asrcRatio=*/1.0);
+            report["isMasterClock"] = isMaster;
+            reports.push_back(report);
+        }
     }
     return ipc::DeviceReportsToJsonArray(reports);
 }
@@ -529,10 +586,12 @@ void PrintStats(const MixerState& st) {
     for (size_t i = 0; i < st.devices.size(); ++i) {
         const DeviceEntry& e = st.devices[i];
         const DeviceStatus s = e.device->Status();
+        const bool hasCapture = ProbeChannelCount(e.device.get(), /*isCapture=*/true) > 0;
+        const bool hasRender = ProbeChannelCount(e.device.get(), /*isCapture=*/false) > 0;
+        const wchar_t* dir = (hasCapture && hasRender) ? L"in+out" : (hasCapture ? L"in" : L"out");
         wprintf(L"  [%zu]%s %s/%s \"%s\"  xrun=%llu  latency=%.2fms  lane=%s\n", i,
                 (e.device.get() == st.masterDevice) ? L" *master*" : L"",
-                Utf8ToWide(e.backend).c_str(), e.isCapture ? L"in" : L"out",
-                Utf8ToWide(e.name).c_str(),
+                Utf8ToWide(e.backend).c_str(), dir, Utf8ToWide(e.name).c_str(),
                 (unsigned long long)(s.underrunCount + s.overrunCount),
                 s.effectiveLatencySeconds * 1000.0, s.lane == Lane::RT ? L"RT" : L"Compat");
     }
@@ -648,6 +707,12 @@ int wmain(int argc, wchar_t** argv) {
             s.pid = (DWORD)nextInt(i, 0);
             ++i;
             specs.push_back(s);
+        } else if (a == L"--vasio") {
+            // vasio.dll(vasio/vasio_driver.cpp)との共有メモリブリッジ。
+            // 単一インスタンス前提なので index/pid は無い(実装ガイド §8.1)。
+            DeviceSpec s;
+            s.backend = DeviceSpec::Backend::Vasio;
+            specs.push_back(s);
         } else if (a == L"--vbcable-in" || a == L"--vbcable-out") {
             const bool wantIn = (a == L"--vbcable-in");
             auto eps = wasapi::DetectVbCable();
@@ -712,7 +777,7 @@ int wmain(int argc, wchar_t** argv) {
         wprintf(L"Usage: sluice-engine [--list]\n"
                 L"  [--asio-in|--asio-out <idx>]... [--wasapi-in|--wasapi-out <idx>]...\n"
                 L"  [--ks-in|--ks-out <idx>]... [--loopback-pid <pid>]...\n"
-                L"  [--vbcable-in] [--vbcable-out] [--vac-line <n>]\n"
+                L"  [--vbcable-in] [--vbcable-out] [--vac-line <n>] [--vasio]\n"
                 L"  [--channels <n>] [--low-latency] [--auto-route]\n"
                 L"Run with --list to see available device indices.\n");
         return 0;

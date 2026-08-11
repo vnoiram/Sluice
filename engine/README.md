@@ -61,6 +61,7 @@ CLI オプション一覧:
 | `--loopback-pid <pid>` | 指定 PID(と子プロセス)の再生音をキャプチャ入力として追加 |
 | `--vbcable-in`/`--vbcable-out` | VB-CABLE を自動検出して追加(未インストールならエラー終了) |
 | `--vac-line <n>` | VAC の Line N を自動検出して追加(capture/render 両方あれば両方) |
+| `--vasio` | `vasio.dll`(仮想 ASIO ドライバ、`vasio/`)との共有メモリブリッジを追加。DAW → エンジン(capture)とエンジン → DAW(render)を同時に提供する単一デバイス(実装ガイド §8.1) |
 | `--channels <n>` | デバイスへ要求するチャンネル数(既定 2。WASAPI はミックスフォーマット優先で無視される) |
 | `--low-latency` | 実装ガイド §5.2.3 の「積極的低遅延モード」をオプトイン(WASAPI に 64 サンプル要求 + RAW モード) |
 | `--auto-route` | 全ストリップを全バスへ 0dB で送る(既定は全ルーティングgainがミュート) |
@@ -114,6 +115,10 @@ device/
   vb_cable.h        VB-CABLE 仮想デバイス検出(実装ガイド §7.1/§7.2)
   vac.h             VAC (Virtual Audio Cable) 仮想デバイス検出。最大256本の
                     "Line N" ペアに対応(実装ガイド §7.1/§7.2)
+  vasio_bridge_device.h/.cpp  IAudioDevice を実装する vasio(仮想 ASIO ドライバ、
+                    /vasio)との共有メモリコンシューマ(実装ガイド §8.1)。
+                    専用の RT スレッドを持たず、マスターの blockCallback から
+                    PumpSharedMemory() で明示的に駆動される点が他の実装と異なる
 graph/
   engine_graph.h    エンジングラフ本体、InputBoundary、RCU 方式のグラフ差し替え
                     (実装ガイド §5.4)
@@ -147,6 +152,7 @@ tests/
   test_ipc_pipe.cpp              名前付きパイプ IPC の実結合テスト(Windows)
   test_wasapi_compile.cpp        WasapiDevice/ProcessLoopbackDevice/VB-CABLE/VAC のコンパイル確認(Windows)
   test_ks_compile.cpp            KsDevice のコンパイル確認(Windows)
+  test_vasio_bridge_compile.cpp  VasioBridgeDevice のコンパイル確認(Windows)
   test_crash_handler.cpp         クラッシュダンプ収集の実結合テスト(Windows)
 scripts/
   run-tests.ps1       Windows Docker コンテナ内で cmake configure/build/ctest を実行

@@ -32,6 +32,7 @@ if(BUILD_ASIO_HOST)
         device/wasapi_device.cpp
         device/process_loopback_device.cpp
         device/ks_device.cpp
+        device/vasio_bridge_device.cpp
         crash/crash_handler.cpp
         sluice-engine.rc
     )

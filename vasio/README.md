@@ -62,10 +62,14 @@ regsvr32 build\Release\vasio.dll
 
 ## 共有メモリプロトコル
 
-`shared_protocol.h` に定義。engine プロセス側のコンシューマ実装
-(`engine/main.cpp` からの接続)は本フェーズの対象外 — `vasio.dll` は
-「エンジンが未接続でも DAW を待たせずに動く」設計(実装ガイド §8.1 手順5)
-なので、この2つは独立にビルド・検証できる。
+`shared_protocol.h` に定義。engine プロセス側のコンシューマ実装は
+`engine/device/vasio_bridge_device.h/.cpp`(`--vasio` フラグで
+`sluice-engine.exe` から起動時に接続する、実装ガイド §8.1 手順3)。
+`vasio.dll` は「エンジンが未接続でも DAW を待たせずに動く」設計(実装ガイド
+§8.1 手順5)なので、この2つは独立にビルド・検証でき、どちらが先に起動しても
+(`CreateFileMappingW` が後発側では既存マッピングを返すだけになるよう
+コーディングしてある)正しく接続する。Windows 実機・実 DAW での接続確認は
+未実施(`engine/README.md` の既知の簡略化を参照)。
 
 - マッピング名 `Local\SluiceVasio.0`、準備完了イベント名
   `Local\SluiceVasioReady.0`(いずれも `vasio::MappingName()`/
@@ -83,10 +87,12 @@ regsvr32 build\Release\vasio.dll
 - サンプルレート変換は一切行わない(DAW 側の要求バッファサイズとエンジン側
   ブロックサイズの差はエンジン境界の ASRC が吸収する設計だが、その ASRC
   自体は engine 側の統合作業でありこのフェーズには含まれない)
-- `engine` 側の共有メモリコンシューマは未実装。`vasio.dll` 単体では
-  「DAW から検出・ロードでき、エンジン未接続時は無音を返す」ところまでが
-  検証範囲(実機での DAW 互換性確認は REAPER → Cubase → Ableton → OBS-ASIO
-  の順、実装ガイド §8.1「テスト」)
+- `engine` 側の共有メモリコンシューマ(`engine/device/vasio_bridge_device.h`)
+  は実装済みだが、Windows 実機・実 DAW でのロード・接続確認は未実施
+  (実機での DAW 互換性確認は REAPER → Cubase → Ableton → OBS-ASIO の順、
+  実装ガイド §8.1「テスト」)
+- エンジン側からの `kAsioResetRequest` 送出(レート/バッファサイズ変更を
+  DAW に伝える経路)は未実装。`ResetPending` を書き込む側の実装が無い
 - 32bit DAW 対応、複数インスタンス対応は将来課題
 
 ## 注意
