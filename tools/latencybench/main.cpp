@@ -13,8 +13,19 @@
 // スコープ: accessMethod は WASAPI 共有モード・WASAPI 排他モード
 // (gap 6・9、engine/device/wasapi_device.h の DeviceStreamConfig::
 // exclusiveMode)・DirectKS(engine/device/ks_device.h)に対応。
-// VAC の "ms per int" や VB-CABLE の内部レイテンシ設定の自動スイープは
-// 未対応のまま(実機の仮想ケーブル導入が要るため、gap 9 の残課題)。
+//
+// gap 9 (VAC 側): --vac-line/--vac-ms-per-int を指定すると
+// vac_registry.h 経由でレジストリの "Milliseconds per interrupt" を書き換え
+// つつスイープする。公式マニュアルにレジストリレイアウトの一次資料はある
+// ものの、実機の VAC インストールでの動作確認ができていないため実験的機能
+// 扱い(vac_registry.h のコメント参照)。既定では無効(フラグ未指定なら
+// 従来どおり)。
+//
+// gap 9 (VB-CABLE 側): 内部レイテンシ/サンプルレートは VBCABLE_ControlPanel
+// (要管理者権限の GUI)経由でのみ設定され、公式にドキュメント化された
+// レジストリキーが見当たらないため、当て推量での自動化はしていない。
+// tools/latencybench/README.md に、実機で reg export の差分を取って
+// 一次情報化する手順を記載した。
 
 #include <windows.h>
 
@@ -33,6 +44,7 @@
 #include "device/vb_cable.h"
 #include "device/wasapi_device.h"
 #include "ipc/json_value.h"
+#include "vac_registry.h"
 #include "xcorr.h"
 
 namespace {
@@ -148,6 +160,7 @@ void PrintUsage() {
         L"Usage: latencybench.exe --list\n"
         L"       latencybench.exe --sweep <render-name-substring> <capture-name-substring>\n"
         L"           [--csv <path>] [--json <path>]\n"
+        L"           [--vac-line <N> --vac-ms-per-int <v1,v2,...>]\n"
         L"\n"
         L"  --list   VB-CABLE/VAC らしき WASAPI デバイスを列挙する\n"
         L"  --sweep  指定した再生/録音デバイス(仮想ケーブルの両端)で\n"
@@ -155,7 +168,16 @@ void PrintUsage() {
         L"           CSV を出力する\n"
         L"  --json   engine/ipc/latency_db.h が読む形式(gap 8: 実測値を\n"
         L"           DeviceCaps.measuredLatencyMs へ自動反映するための入力)\n"
-        L"           で測定結果を書き出す。失敗した組み合わせは含めない。\n");
+        L"           で測定結果を書き出す。失敗した組み合わせは含めない。\n"
+        L"  --vac-line / --vac-ms-per-int\n"
+        L"           gap 9(実験的機能、要管理者権限、実機未検証): 指定した\n"
+        L"           VAC ケーブル番号(--list の \"VAC Line N\" の N)に対し、\n"
+        L"           レジストリの \"Milliseconds per interrupt\" を \n"
+        L"           <v1,v2,...>(各 1..20)へ順に書き換えつつ外側でスイープ\n"
+        L"           する。レジストリ書き込み・ドライバ再起動・読み戻し確認の\n"
+        L"           いずれかに失敗した設定値はスキップされ、CSV/JSON には\n"
+        L"           含まれない。詳細・既知の未検証事項は\n"
+        L"           tools/latencybench/vac_registry.h と README.md を参照。\n");
 }
 
 void ListVirtualDevices() {
@@ -194,9 +216,29 @@ int wmain(int argc, wchar_t** argv) {
     const std::wstring renderNameSubstr = argv[2];
     const std::wstring captureNameSubstr = argv[3];
     std::wstring csvPath, jsonPath;
+    int vacLineNumber = -1;
+    std::vector<int> vacMsPerIntValues;  // 空なら未使用(gap 9: VAC 内部設定スイープ、実験的機能)
     for (int i = 4; i + 1 < argc; ++i) {
         if (wcscmp(argv[i], L"--csv") == 0) csvPath = argv[i + 1];
         if (wcscmp(argv[i], L"--json") == 0) jsonPath = argv[i + 1];
+        if (wcscmp(argv[i], L"--vac-line") == 0) vacLineNumber = _wtoi(argv[i + 1]);
+        if (wcscmp(argv[i], L"--vac-ms-per-int") == 0) {
+            const std::wstring list = argv[i + 1];
+            size_t start = 0;
+            while (start <= list.size()) {
+                const size_t comma = list.find(L',', start);
+                const std::wstring token =
+                    list.substr(start, comma == std::wstring::npos ? std::wstring::npos : comma - start);
+                if (!token.empty()) vacMsPerIntValues.push_back(_wtoi(token.c_str()));
+                if (comma == std::wstring::npos) break;
+                start = comma + 1;
+            }
+        }
+    }
+
+    if (!vacMsPerIntValues.empty() && vacLineNumber < 0) {
+        std::wprintf(L"--vac-ms-per-int には --vac-line <N> の指定も必要です\n");
+        return 1;
     }
 
     // レンダー/キャプチャエンドポイントを名前の部分一致で検索する。
@@ -219,100 +261,141 @@ int wmain(int argc, wchar_t** argv) {
     std::vector<std::string> csvLines;
     csvLines.push_back(
         "renderDevice,captureDevice,accessMethod,requestedBufferFrames,effectiveLatencyMs,"
-        "xrunCount,cpuPercent");
+        "xrunCount,cpuPercent,vacMsPerInt");
     JsonValue jsonResults = JsonValue::MakeArray();
     const std::string renderNameUtf8 = WideToUtf8(renderNameSubstr);
     const std::string captureNameUtf8 = WideToUtf8(captureNameSubstr);
 
-    for (AccessMethod method : methods) {
-        for (uint32_t bufferFrames : bufferSizes) {
-            DeviceStreamConfig config;
-            config.channels = 1;
-            config.sampleRate = 48000.0;
-            config.preferredBufferFrames = (long)bufferFrames;
-            config.aggressiveLowLatency = true;
-            // gap 9: 排他モードでは共有エンジンの小バッファ要求パスを
-            // 使わない(意味が異なる、engine/device/wasapi_device.cpp の
-            // Open() 参照)。exclusiveMode 自体が唯一のモード切り替えなので
-            // aggressiveLowLatency は無視されるが、明示的に false にして
-            // おく方が意図が伝わる。
-            if (method == AccessMethod::WasapiExclusive) {
-                config.aggressiveLowLatency = false;
-                config.exclusiveMode = true;
-            }
+    // gap 9 (VAC 側、実験的機能): --vac-ms-per-int が指定されていなければ
+    // 従来どおり単一パス(サイズ 1 の {-1} = 「該当なし」)で回す。
+    std::vector<int> vacSweepValues = vacMsPerIntValues.empty() ? std::vector<int>{-1} : vacMsPerIntValues;
 
-            std::unique_ptr<IAudioDevice> renderDevice, captureDevice;
-            if (method == AccessMethod::WasapiShared || method == AccessMethod::WasapiExclusive) {
-                renderDevice = std::make_unique<wasapi::WasapiDevice>(renderId, false);
-                captureDevice = std::make_unique<wasapi::WasapiDevice>(captureId, true);
-            } else {
-                // DirectKS は WasapiDevice とは別列挙(SetupDiGetClassDevs)なので、
-                // 名前一致で該当フィルタを探す。
-                std::vector<ks::KsDeviceInfo> ksDevices = ks::EnumerateKsAudioDevices();
-                ks::KsDeviceInfo renderInfo, captureInfo;
-                bool foundRender = false, foundCapture = false;
-                for (const auto& d : ksDevices) {
-                    if (!foundRender && d.friendlyName.find(renderNameSubstr) != std::wstring::npos) {
-                        renderInfo = d;
-                        foundRender = true;
-                    }
-                    if (!foundCapture &&
-                        d.friendlyName.find(captureNameSubstr) != std::wstring::npos) {
-                        captureInfo = d;
-                        foundCapture = true;
-                    }
-                }
-                if (!foundRender || !foundCapture) continue;  // KS 経路にこの名前の一致なし
-                renderDevice = std::make_unique<ks::KsDevice>(renderInfo, false);
-                captureDevice = std::make_unique<ks::KsDevice>(captureInfo, true);
-            }
-
-            std::wstring err;
-            if (!renderDevice->Open(config, &err) || !captureDevice->Open(config, &err)) {
-                std::wprintf(L"open failed (%s, buffer=%u): %s\n", AccessMethodName(method),
-                             bufferFrames, err.c_str());
+    for (int vacMsPerInt : vacSweepValues) {
+        if (vacMsPerInt >= 0) {
+            std::wprintf(L"[vac] line %d: Milliseconds per interrupt = %d へ設定中"
+                        L"(実験的機能、実機未検証)\n",
+                        vacLineNumber, vacMsPerInt);
+            std::wstring vacErr;
+            if (!vac_registry::WriteMsPerInt(vacLineNumber, (DWORD)vacMsPerInt, &vacErr)) {
+                std::wprintf(L"[vac] レジストリ書き込み失敗、この設定値をスキップ: %s\n", vacErr.c_str());
                 continue;
             }
-            renderDevice->Start();
-            captureDevice->Start();
-
-            MeasurementResult r =
-                RunOneMeasurement(*renderDevice, *captureDevice, config.sampleRate, bufferFrames);
-
-            renderDevice->Stop();
-            captureDevice->Stop();
-            renderDevice->Close();
-            captureDevice->Close();
-
-            char line[512];
-            if (r.ok) {
-                std::snprintf(line, sizeof(line), "%s,%s,%ls,%u,%.3f,%llu,%.2f",
-                              renderNameUtf8.c_str(), captureNameUtf8.c_str(),
-                              AccessMethodName(method), bufferFrames, r.effectiveLatencyMs,
-                              (unsigned long long)r.xrunCount, r.cpuPercent);
-
-                // --json (gap 8): 失敗した組み合わせは含めない
-                // (engine/ipc/latency_db.h::LookupMeasuredLatencyMs は
-                // xrunCount==0 の測定だけを見るので、失敗行を混ぜても実害は
-                // 無いが、意味のある measuredLatencyMs が無いので素直に除外する)。
-                JsonValue entry = JsonValue::MakeObject();
-                entry["renderDevice"] = renderNameUtf8;
-                entry["captureDevice"] = captureNameUtf8;
-                entry["accessMethod"] = WideToUtf8(AccessMethodName(method));
-                entry["requestedBufferFrames"] = (int)bufferFrames;
-                entry["measuredLatencyMs"] = r.effectiveLatencyMs;
-                entry["xrunCount"] = (double)r.xrunCount;
-                entry["cpuPercent"] = r.cpuPercent;
-                jsonResults.Push(entry);
-            } else {
-                std::snprintf(line, sizeof(line), "%s,%s,%ls,%u,FAILED,,",
-                              renderNameUtf8.c_str(), captureNameUtf8.c_str(),
-                              AccessMethodName(method), bufferFrames);
+            if (!vac_registry::RestartDriverService(&vacErr)) {
+                std::wprintf(L"[vac] ドライバ再起動失敗、この設定値をスキップ"
+                            L"(VAC Control Panel の \"Restart Driver\" を手動で実行し、"
+                            L"改めてこの値だけで再実行してください): %s\n",
+                            vacErr.c_str());
+                continue;
             }
-            csvLines.push_back(line);
-            std::wprintf(L"%hs\n", line);
+            DWORD readBack = 0;
+            if (!vac_registry::ReadMsPerInt(vacLineNumber, &readBack, &vacErr) ||
+                (int)readBack != vacMsPerInt) {
+                std::wprintf(L"[vac] 読み戻し値が書き込み値と一致しない"
+                            L"(read=%lu, want=%d)、この設定値をスキップ\n",
+                            readBack, vacMsPerInt);
+                continue;
+            }
         }
-    }
+
+        for (AccessMethod method : methods) {
+            for (uint32_t bufferFrames : bufferSizes) {
+                DeviceStreamConfig config;
+                config.channels = 1;
+                config.sampleRate = 48000.0;
+                config.preferredBufferFrames = (long)bufferFrames;
+                config.aggressiveLowLatency = true;
+                // gap 9: 排他モードでは共有エンジンの小バッファ要求パスを
+                // 使わない(意味が異なる、engine/device/wasapi_device.cpp の
+                // Open() 参照)。exclusiveMode 自体が唯一のモード切り替えなので
+                // aggressiveLowLatency は無視されるが、明示的に false にして
+                // おく方が意図が伝わる。
+                if (method == AccessMethod::WasapiExclusive) {
+                    config.aggressiveLowLatency = false;
+                    config.exclusiveMode = true;
+                }
+
+                std::unique_ptr<IAudioDevice> renderDevice, captureDevice;
+                if (method == AccessMethod::WasapiShared || method == AccessMethod::WasapiExclusive) {
+                    renderDevice = std::make_unique<wasapi::WasapiDevice>(renderId, false);
+                    captureDevice = std::make_unique<wasapi::WasapiDevice>(captureId, true);
+                } else {
+                    // DirectKS は WasapiDevice とは別列挙(SetupDiGetClassDevs)なので、
+                    // 名前一致で該当フィルタを探す。
+                    std::vector<ks::KsDeviceInfo> ksDevices = ks::EnumerateKsAudioDevices();
+                    ks::KsDeviceInfo renderInfo, captureInfo;
+                    bool foundRender = false, foundCapture = false;
+                    for (const auto& d : ksDevices) {
+                        if (!foundRender &&
+                            d.friendlyName.find(renderNameSubstr) != std::wstring::npos) {
+                            renderInfo = d;
+                            foundRender = true;
+                        }
+                        if (!foundCapture &&
+                            d.friendlyName.find(captureNameSubstr) != std::wstring::npos) {
+                            captureInfo = d;
+                            foundCapture = true;
+                        }
+                    }
+                    if (!foundRender || !foundCapture) continue;  // KS 経路にこの名前の一致なし
+                    renderDevice = std::make_unique<ks::KsDevice>(renderInfo, false);
+                    captureDevice = std::make_unique<ks::KsDevice>(captureInfo, true);
+                }
+
+                std::wstring err;
+                if (!renderDevice->Open(config, &err) || !captureDevice->Open(config, &err)) {
+                    std::wprintf(L"open failed (%s, buffer=%u): %s\n", AccessMethodName(method),
+                                 bufferFrames, err.c_str());
+                    continue;
+                }
+                renderDevice->Start();
+                captureDevice->Start();
+
+                MeasurementResult r =
+                    RunOneMeasurement(*renderDevice, *captureDevice, config.sampleRate, bufferFrames);
+
+                renderDevice->Stop();
+                captureDevice->Stop();
+                renderDevice->Close();
+                captureDevice->Close();
+
+                char vacLabel[16];
+                if (vacMsPerInt >= 0) {
+                    std::snprintf(vacLabel, sizeof(vacLabel), "%d", vacMsPerInt);
+                } else {
+                    vacLabel[0] = '\0';
+                }
+
+                char line[512];
+                if (r.ok) {
+                    std::snprintf(line, sizeof(line), "%s,%s,%ls,%u,%.3f,%llu,%.2f,%s",
+                                  renderNameUtf8.c_str(), captureNameUtf8.c_str(),
+                                  AccessMethodName(method), bufferFrames, r.effectiveLatencyMs,
+                                  (unsigned long long)r.xrunCount, r.cpuPercent, vacLabel);
+
+                    // --json (gap 8): 失敗した組み合わせは含めない
+                    // (engine/ipc/latency_db.h::LookupMeasuredLatencyMs は
+                    // xrunCount==0 の測定だけを見るので、失敗行を混ぜても実害は
+                    // 無いが、意味のある measuredLatencyMs が無いので素直に除外する)。
+                    JsonValue entry = JsonValue::MakeObject();
+                    entry["renderDevice"] = renderNameUtf8;
+                    entry["captureDevice"] = captureNameUtf8;
+                    entry["accessMethod"] = WideToUtf8(AccessMethodName(method));
+                    entry["requestedBufferFrames"] = (int)bufferFrames;
+                    entry["measuredLatencyMs"] = r.effectiveLatencyMs;
+                    entry["xrunCount"] = (double)r.xrunCount;
+                    entry["cpuPercent"] = r.cpuPercent;
+                    if (vacMsPerInt >= 0) entry["vacMsPerInt"] = vacMsPerInt;
+                    jsonResults.Push(entry);
+                } else {
+                    std::snprintf(line, sizeof(line), "%s,%s,%ls,%u,FAILED,,,%s",
+                                  renderNameUtf8.c_str(), captureNameUtf8.c_str(),
+                                  AccessMethodName(method), bufferFrames, vacLabel);
+                }
+                csvLines.push_back(line);
+                std::wprintf(L"%hs\n", line);
+            }
+        }
+    }  // for (vacMsPerInt : vacSweepValues)  (gap 9: VAC 内部設定スイープ)
 
     if (!csvPath.empty()) {
         std::wofstream out(csvPath);

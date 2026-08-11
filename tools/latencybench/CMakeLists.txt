@@ -31,7 +31,7 @@ if(BUILD_LATENCYBENCH)
     )
 
     target_link_libraries(latencybench PRIVATE
-        ole32 avrt mmdevapi setupapi ksuser
+        ole32 avrt mmdevapi setupapi ksuser advapi32
     )
 
     target_compile_definitions(latencybench PRIVATE
