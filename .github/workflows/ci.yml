@@ -11,10 +11,14 @@
 # 各ジョブは Windows Docker 経由のローカル開発スクリプト
 # (scripts/build-*-in-windows-docker.ps1)が最終的に呼ぶのと同じ
 # engine/scripts/run-tests.ps1・vasio/scripts/run-build.ps1・
-# ui/scripts/run-tests.ps1 を、windows-latest ランナー上で直接(Docker層を
+# ui/scripts/run-tests.ps1 を、windows-2022 ランナー上で直接(Docker層を
 # 挟まずに)呼び出す。ランナーは Windows Server ベースで Visual Studio 2022
 # Build Tools・vcpkg(VCPKG_INSTALLATION_ROOT)が既定でプリインストールされて
-# いる前提(GitHub がドキュメント化している windows-latest イメージの仕様)。
+# いる前提(GitHub がドキュメント化している windows-2022 イメージの仕様)。
+# セキュリティ監査(docs/security-audit-2026-08-12.md)の指摘に基づき、
+# windows-latest(可変)ではなく特定バージョンのランナーイメージに固定し、
+# actions/checkout・actions/setup-dotnet もタグではなくコミット SHA に
+# 固定している(サプライチェーン改ざん対策)。
 #
 # 注意: このワークフローは Windows GitHub-hosted ランナー上での実行で
 # 検証されていない(この開発環境が WSL/Linux のため)。初回実行時に
@@ -32,9 +36,9 @@ on:
 jobs:
   engine:
     name: engine core tests + tools/latencybench + tools/devprobe
-    runs-on: windows-latest
+    runs-on: windows-2022
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4.4.0
 
       - name: Install libsamplerate (vcpkg)
         shell: pwsh
@@ -49,9 +53,9 @@ jobs:
 
   vasio:
     name: vasio shared-memory protocol
-    runs-on: windows-latest
+    runs-on: windows-2022
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4.4.0
 
       - name: Configure, build, test
         shell: pwsh
@@ -60,11 +64,11 @@ jobs:
 
   ui:
     name: SluiceUi (.NET)
-    runs-on: windows-latest
+    runs-on: windows-2022
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4.4.0
 
-      - uses: actions/setup-dotnet@v4
+      - uses: actions/setup-dotnet@67a3573c9a986a3f9c594539f4ab511d57bb3ce9  # v4.3.1
         with:
           dotnet-version: "8.0.x"
 

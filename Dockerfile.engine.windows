@@ -11,24 +11,42 @@ FROM mcr.microsoft.com/windows/servercore:ltsc2022
 
 SHELL ["powershell", "-NoLogo", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command"]
 
+# セキュリティ監査(docs/security-audit-2026-08-12.md)の指摘に基づき、
+# すべてのダウンロードをチェックサム検証する。vcpkg は可変な master ブランチ
+# 先端ではなく特定リリースタグに固定する。VS Build Tools は Microsoft 側に
+# バージョン固定可能な URL が無いため(常に「17系最新」を指すリダイレクト)、
+# バージョン固定は諦め、代わりに取得時点のハッシュ値を記録して改ざん検知の
+# 用途で検証する(Microsoft が実体を差し替えた場合はビルドが失敗して気づける
+# ようにする)。ハッシュ値はいずれもこの Dockerfile 更新時点のもの — 正規の
+# 更新(vcpkg のタグ更新、VS Build Tools のローテーション)で古くなった場合は
+# 再取得して更新すること。
 ARG VS_BUILDTOOLS_URL=https://aka.ms/vs/17/release/vs_BuildTools.exe
+ARG VS_BUILDTOOLS_SHA256=15df9d3b4c2b2eaf44704d5e938c895341b9cd8ba40a9a18610f8d18cbe01b53
 ARG CMAKE_ZIP_URL=https://github.com/Kitware/CMake/releases/download/v3.29.3/cmake-3.29.3-windows-x86_64.zip
-ARG VCPKG_ZIP_URL=https://github.com/microsoft/vcpkg/archive/refs/heads/master.zip
+ARG CMAKE_ZIP_SHA256=6423ed300e6aa1b15c4aeae9a7399157f53fc84a2fb7242ca64c8dfd83e5f8a6
+ARG VCPKG_ZIP_URL=https://github.com/microsoft/vcpkg/archive/refs/tags/2026.07.29.zip
+ARG VCPKG_ZIP_SHA256=657f91fe1e80a744a0578983cf3b9660514eb280f8fbc736e2dce0a860a53283
 
 RUN Invoke-WebRequest -Uri $env:VS_BUILDTOOLS_URL -OutFile C:\vs_BuildTools.exe; `
+    if ((Get-FileHash C:\vs_BuildTools.exe -Algorithm SHA256).Hash -ne $env:VS_BUILDTOOLS_SHA256) { `
+        Write-Error 'vs_BuildTools.exe: SHA256 mismatch, refusing to install'; exit 1 }; `
     Start-Process -FilePath C:\vs_BuildTools.exe -Wait -ArgumentList @('--quiet','--wait','--norestart','--nocache','--installPath','C:\BuildTools','--add','Microsoft.VisualStudio.Workload.VCTools','--add','Microsoft.VisualStudio.Component.VC.Tools.x86.x64','--add','Microsoft.VisualStudio.Component.Windows10SDK.19041'); `
     if (($LASTEXITCODE -ne 0) -and ($LASTEXITCODE -ne 3010)) { exit $LASTEXITCODE }; `
     Remove-Item C:\vs_BuildTools.exe -Force
 
 RUN Invoke-WebRequest -Uri $env:CMAKE_ZIP_URL -OutFile C:\cmake.zip; `
+    if ((Get-FileHash C:\cmake.zip -Algorithm SHA256).Hash -ne $env:CMAKE_ZIP_SHA256) { `
+        Write-Error 'cmake.zip: SHA256 mismatch, refusing to install'; exit 1 }; `
     Expand-Archive -Path C:\cmake.zip -DestinationPath C:\ -Force; `
     Get-ChildItem 'C:\' -Filter 'cmake-*-windows-x86_64' -Directory | `
         Rename-Item -NewName 'cmake'; `
     Remove-Item C:\cmake.zip -Force
 
 RUN Invoke-WebRequest -Uri $env:VCPKG_ZIP_URL -OutFile C:\vcpkg.zip; `
+    if ((Get-FileHash C:\vcpkg.zip -Algorithm SHA256).Hash -ne $env:VCPKG_ZIP_SHA256) { `
+        Write-Error 'vcpkg.zip: SHA256 mismatch, refusing to install'; exit 1 }; `
     Expand-Archive -Path C:\vcpkg.zip -DestinationPath C:\ -Force; `
-    Rename-Item -Path 'C:\vcpkg-master' -NewName 'vcpkg'; `
+    Rename-Item -Path 'C:\vcpkg-2026.07.29' -NewName 'vcpkg'; `
     Remove-Item C:\vcpkg.zip -Force; `
     & C:\vcpkg\bootstrap-vcpkg.bat -disableMetrics; `
     if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
