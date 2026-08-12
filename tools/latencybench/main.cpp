@@ -39,6 +39,9 @@
 
 #include <windows.h>
 
+#include <fcntl.h>  // _O_U8TEXT(wmain() 冒頭の _setmode 用)
+#include <io.h>     // _setmode/_fileno
+
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
@@ -67,6 +70,18 @@ std::string WideToUtf8(const std::wstring& w) {
         WideCharToMultiByte(CP_UTF8, 0, w.c_str(), (int)w.size(), nullptr, 0, nullptr, nullptr);
     std::string out((size_t)len, '\0');
     WideCharToMultiByte(CP_UTF8, 0, w.c_str(), (int)w.size(), out.data(), len, nullptr, nullptr);
+    return out;
+}
+
+// WideToUtf8 の逆変換。csvLines(UTF-8 std::string)をコンソールへ echo する
+// ときに使う。%hs での echo は現在のロケール前提でナロー→ワイド変換される
+// ため、非 ASCII を含む UTF-8 バイト列を渡すと文字化けする(_setmode の
+// コメント参照)。wprintf(L"%s", ...) で渡せるよう明示的にワイドへ戻す。
+std::wstring Utf8ToWide(const std::string& s) {
+    if (s.empty()) return {};
+    const int len = MultiByteToWideChar(CP_UTF8, 0, s.c_str(), (int)s.size(), nullptr, 0);
+    std::wstring out((size_t)len, L'\0');
+    MultiByteToWideChar(CP_UTF8, 0, s.c_str(), (int)s.size(), out.data(), len);
     return out;
 }
 
@@ -254,6 +269,15 @@ void ListVirtualDevices() {
 }  // namespace
 
 int wmain(int argc, wchar_t** argv) {
+    // stdout/stderr を UTF-8 出力モードにする。既定(ロケール "C")のままだと
+    // wprintf は非 ASCII 文字を '?' に潰して出力する ── これは「コンソールで
+    // 見えている文字」の問題ではなく、CRT のワイド→ナローストリーム変換の
+    // 問題で、コンソールへ直接出しているとき(通常の cmd.exe/PowerShell)も
+    // パイプ/リダイレクト経由(WSL 越しに実行した場合など)でも起きる。
+    // デバイスのフレンドリ名は非 ASCII を含みうるため必須。
+    _setmode(_fileno(stdout), _O_U8TEXT);
+    _setmode(_fileno(stderr), _O_U8TEXT);
+
     // engine/main.cpp と同じ理由: EnumerateEndpoints/WasapiDevice/KsDevice が
     // 呼ぶ CoCreateInstance 系 API は呼び出し側スレッドでの COM 初期化を
     // 前提とする。これを忘れると CoCreateInstance が CO_E_NOTINITIALIZED で
@@ -481,7 +505,7 @@ int wmain(int argc, wchar_t** argv) {
                                   AccessMethodName(method), bufferFrames, vacLabel);
                 }
                 csvLines.push_back(line);
-                std::wprintf(L"%hs\n", line);
+                std::wprintf(L"%s\n", Utf8ToWide(line).c_str());
             }
         }
     }  // for (vacMsPerInt : vacSweepValues)  (gap 9: VAC 内部設定スイープ)
