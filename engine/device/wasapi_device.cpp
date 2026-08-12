@@ -234,8 +234,10 @@ private:
 // ===========================================================================
 // 構築 / Open / Start / Stop / Close
 // ===========================================================================
-WasapiDevice::WasapiDevice(std::wstring endpointId, bool isCapture)
-    : endpointId_(std::move(endpointId)), isCapture_(isCapture) {}
+WasapiDevice::WasapiDevice(std::wstring endpointId, bool isCapture, bool loopback)
+    : endpointId_(std::move(endpointId)),
+      isCapture_(isCapture || loopback),  // loopback は常にキャプチャ側として振る舞う(wasapi_device.h 参照)
+      loopback_(loopback) {}
 
 // ===========================================================================
 // 周期問い合わせ(実装ガイド §5.2.1)。Probe()/Open() 共通ヘルパ。
@@ -282,9 +284,13 @@ DeviceCaps WasapiDevice::Probe(double sampleRate) {
                                 reinterpret_cast<void**>(&enumerator))))
         return caps;
 
+    // loopback_ の場合、endpointId_ はレンダー側エンドポイントを指す
+    // (wasapi_device.h のコンストラクタコメント参照)。
+    const bool wantCaptureRole = isCapture_ && !loopback_;
+
     IMMDevice* device = nullptr;
     HRESULT hr = endpointId_.empty()
-        ? enumerator->GetDefaultAudioEndpoint(isCapture_ ? eCapture : eRender, eConsole, &device)
+        ? enumerator->GetDefaultAudioEndpoint(wantCaptureRole ? eCapture : eRender, eConsole, &device)
         : enumerator->GetDevice(endpointId_.c_str(), &device);
     if (FAILED(hr) || !device) {
         enumerator->Release();
@@ -341,13 +347,20 @@ bool WasapiDevice::Open(const DeviceStreamConfig& config, std::wstring* errorOut
     // 決め打ちしない。config.preferredBufferFrames だけ低遅延パスの
     // 周期要求に使う(下記参照)。
 
+    // WASAPI loopback capture は仕様上シェアードモード専用(MSDN)。
+    if (loopback_ && config.exclusiveMode)
+        return fail(L"WASAPI loopback capture does not support exclusive mode");
+
     if (FAILED(CoCreateInstance(__uuidof(MMDeviceEnumerator), nullptr,
                                 CLSCTX_ALL, __uuidof(IMMDeviceEnumerator),
                                 reinterpret_cast<void**>(&enumerator_))))
         return fail(L"CoCreateInstance(MMDeviceEnumerator) failed");
 
+    // loopback_ の場合、endpointId_ はレンダー側エンドポイントを指す
+    // (wasapi_device.h のコンストラクタコメント参照)。
+    const bool wantCaptureRole = isCapture_ && !loopback_;
     HRESULT hr = endpointId_.empty()
-        ? enumerator_->GetDefaultAudioEndpoint(isCapture_ ? eCapture : eRender,
+        ? enumerator_->GetDefaultAudioEndpoint(wantCaptureRole ? eCapture : eRender,
                                                eConsole, &device_)
         : enumerator_->GetDevice(endpointId_.c_str(), &device_);
     if (FAILED(hr) || !device_) return fail(L"failed to resolve WASAPI endpoint");
@@ -388,6 +401,13 @@ bool WasapiDevice::Open(const DeviceStreamConfig& config, std::wstring* errorOut
             return fail(L"unsupported WASAPI mix format (PCM/IEEE_FLOAT only)");
         }
 
+        // loopback_ なら AUDCLNT_STREAMFLAGS_LOOPBACK を足す。
+        // IAudioClient3::InitializeSharedAudioStream/IAudioClient::Initialize の
+        // どちらも同じ AUDCLNT_STREAMFLAGS_XXX を StreamFlags に取るため
+        // (MSDN)、以下 3 箇所の Initialize すべてで共通に使う。
+        const DWORD streamFlags =
+            AUDCLNT_STREAMFLAGS_EVENTCALLBACK | (loopback_ ? AUDCLNT_STREAMFLAGS_LOOPBACK : 0);
+
         // 低遅延パス(実装ガイド §5.2.1〜§5.2.3): config.aggressiveLowLatency が
         // true のときだけ IAudioClient3 の小バッファ要求パスを試す。既定
         // (false)ではデバイス既定周期(defaultPeriod)で開く ——
@@ -406,7 +426,7 @@ bool WasapiDevice::Open(const DeviceStreamConfig& config, std::wstring* errorOut
                 }
 
                 HRESULT hrInit = client3->InitializeSharedAudioStream(
-                    AUDCLNT_STREAMFLAGS_EVENTCALLBACK, periodFrames, mixFormat, nullptr);
+                    streamFlags, periodFrames, mixFormat, nullptr);
 
                 if (hrInit == AUDCLNT_E_ENGINE_PERIODICITY_LOCKED) {
                     // 実装ガイド §5.2.2: 複数の WASAPI デバイスを同時に開く
@@ -417,7 +437,7 @@ bool WasapiDevice::Open(const DeviceStreamConfig& config, std::wstring* errorOut
                     UINT32 curPeriod = 0;
                     if (SUCCEEDED(client3->GetCurrentSharedModeEnginePeriod(&curFmt, &curPeriod))) {
                         hrInit = client3->InitializeSharedAudioStream(
-                            AUDCLNT_STREAMFLAGS_EVENTCALLBACK, curPeriod, curFmt, nullptr);
+                            streamFlags, curPeriod, curFmt, nullptr);
                         if (curFmt) CoTaskMemFree(curFmt);
                     }
                 }
@@ -430,7 +450,7 @@ bool WasapiDevice::Open(const DeviceStreamConfig& config, std::wstring* errorOut
             // 最終フォールバック: 10ms 周期を要求(100ns 単位: 1ms = 10,000)。
             constexpr REFERENCE_TIME kBufferDuration = 10 * 10000;
             initialized = SUCCEEDED(audioClient_->Initialize(
-                AUDCLNT_SHAREMODE_SHARED, AUDCLNT_STREAMFLAGS_EVENTCALLBACK,
+                AUDCLNT_SHAREMODE_SHARED, streamFlags,
                 kBufferDuration, 0, mixFormat, nullptr));
         }
         CoTaskMemFree(mixFormat);

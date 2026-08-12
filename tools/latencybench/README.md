@@ -86,6 +86,39 @@ fc before.reg after.reg
 (`HKLM\SOFTWARE` 全体は大きいので、`VB-Audio` 等それらしいサブキーが
 分かっていれば範囲を絞ってよい。)
 
+## VAD(レンダー専用の仮想デバイス)向けの loopback capture
+
+VAC/VB-CABLE は「録音側エンドポイントを別途持つケーブル」構造だが、
+[VirtualDrivers/Virtual-Audio-Driver](https://github.com/VirtualDrivers/Virtual-Audio-Driver)
+(MIT ライセンス、Microsoft の SysVAD サンプル由来のオープンソース WDM
+ドライバ)のように**仮想スピーカー(レンダー)しか持たない**、または
+スピーカーとマイクが内部で繋がっていないデバイスでは、既存の
+`--sweep <render> <capture>` の往復測定方式(render に送った音が同じ
+ケーブルの capture に出てくる前提)は使えない(ソースを確認したところ、
+このドライバの仮想スピーカーと仮想マイクは内部で繋がっていない)。
+
+`--loopback` を指定すると、WASAPI loopback capture(対象ドライバの対応が
+不要な OS 標準機能)でレンダーエンドポイント自身を録音側として使う:
+
+```bat
+build\Release\latencybench.exe --list
+:: 例: "Virtual Speaker" のような名前が見えるはず
+
+build\Release\latencybench.exe --sweep "Virtual Speaker" "Virtual Speaker" ^
+  --loopback --csv vad-sweep.csv
+```
+
+- 第2引数(capture 側の名前)は無視されるが、CLI の形は変えていないので
+  第1引数と同じ値を渡せばよい。
+- `accessMethod` は `wasapi_shared_loopback` のみ(排他モード・DirectKS は
+  対象外。WASAPI loopback capture は仕様上シェアードモード専用)。
+- このドライバはベータ扱いで test signing が必要な場合がある
+  (`bcdedit /set testsigning on`。README 参照)。導入手順はドライバ側の
+  リポジトリに従うこと(Sluice はこのドライバを同梱しない)。
+- ドライバのソースを見た限り、内部バッファ/割り込み間隔はサンプル実装の
+  1ms 固定(可変レジストリ設定は無い)なので、VAC の `--vac-ms-per-int`
+  に相当する内部設定スイープの対象にはならない。
+
 ## Windows Docker では実機 I/O 検証ができない
 
 `scripts/build-latencybench-in-windows-docker.ps1` はコンパイル・
@@ -109,8 +142,10 @@ VAC/VB-CABLE のようなカーネルモードドライバをコンテナ内に�
 `xcorr.h`(信号生成・相互相関)は Windows API に依存しないため、この
 Linux/WSL 開発環境で実際にビルド・実行して検証済み(`tests/test_xcorr.cpp`、
 既知の遅延に対するオフセット検出精度・ノイズ耐性を確認)。`main.cpp` 本体
-(実デバイス I/O)は他の Windows 専用コードと同じ制約で実機・Windows Docker
-でのコンパイル確認ができていない。
+(実デバイス I/O)は Windows Docker(`scripts/build-latencybench-in-windows-docker.ps1`)
+上での MSVC コンパイル・`xcorr` テスト実行(1/1 pass)を確認済み(`--vac-*`・
+`--loopback` を含む)。ただし前述の通り、これはコンパイル確認であり、
+実機の仮想デバイスに対する実際の I/O 動作・測定値の正しさはまだ未検証。
 
 ## 出力の使い道(実装ガイド §7.3)
 

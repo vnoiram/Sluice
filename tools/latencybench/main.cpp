@@ -26,6 +26,16 @@
 // レジストリキーが見当たらないため、当て推量での自動化はしていない。
 // tools/latencybench/README.md に、実機で reg export の差分を取って
 // 一次情報化する手順を記載した。
+//
+// --loopback: VAC/VB-CABLE のような「レンダー/キャプチャの両端を持つ
+// ケーブル」構造ではなく、レンダー(仮想スピーカー)しか持たない仮想デバイス
+// (例: VirtualDrivers/Virtual-Audio-Driver、MIT ライセンスのオープンソース
+// WDM ドライバ。ソースを直接確認したところ、その仮想スピーカーと仮想マイクは
+// 内部で繋がっておらず、既存の「render→同じケーブルの capture で拾う」方式
+// では測定できない)向けに、WASAPI loopback capture(対象ドライバの対応が
+// 不要な OS 標準機能。engine/device/wasapi_device.h の WasapiDevice の
+// loopback コンストラクタ引数)でレンダーエンドポイント自身を録音側として
+// 使う。AccessMethod::WasapiSharedLoopback 参照。
 
 #include <windows.h>
 
@@ -62,12 +72,21 @@ std::string WideToUtf8(const std::wstring& w) {
 
 // gap 9: WasapiExclusive を追加(WASAPI 排他モード、gap 6 で
 // DeviceStreamConfig::exclusiveMode が実装されたことで測定可能になった)。
-enum class AccessMethod { WasapiShared, WasapiExclusive, DirectKs };
+//
+// WasapiSharedLoopback: VAC/VB-CABLE のような「録音側エンドポイントを別途
+// 持つケーブル」構造ではなく、VirtualDrivers/Virtual-Audio-Driver のように
+// レンダー(仮想スピーカー)しか持たず、録音側の仮想マイクとは内部で
+// 繋がっていない仮想デバイス向け。--loopback 指定時のみ使う
+// (engine/device/wasapi_device.h の WasapiDevice loopback コンストラクタ
+// 引数、WASAPI loopback capture という OS 標準機能を使うため、対象ドライバ
+// 側の対応・レジストリ知識は不要)。
+enum class AccessMethod { WasapiShared, WasapiExclusive, WasapiSharedLoopback, DirectKs };
 
 const wchar_t* AccessMethodName(AccessMethod m) {
     switch (m) {
         case AccessMethod::WasapiShared: return L"wasapi_shared";
         case AccessMethod::WasapiExclusive: return L"wasapi_exclusive";
+        case AccessMethod::WasapiSharedLoopback: return L"wasapi_shared_loopback";
         case AccessMethod::DirectKs: return L"directks";
     }
     return L"unknown";
@@ -161,6 +180,7 @@ void PrintUsage() {
         L"       latencybench.exe --sweep <render-name-substring> <capture-name-substring>\n"
         L"           [--csv <path>] [--json <path>]\n"
         L"           [--vac-line <N> --vac-ms-per-int <v1,v2,...>]\n"
+        L"           [--loopback]\n"
         L"\n"
         L"  --list   VB-CABLE/VAC らしき WASAPI デバイスを列挙する\n"
         L"  --sweep  指定した再生/録音デバイス(仮想ケーブルの両端)で\n"
@@ -177,7 +197,17 @@ void PrintUsage() {
         L"           する。レジストリ書き込み・ドライバ再起動・読み戻し確認の\n"
         L"           いずれかに失敗した設定値はスキップされ、CSV/JSON には\n"
         L"           含まれない。詳細・既知の未検証事項は\n"
-        L"           tools/latencybench/vac_registry.h と README.md を参照。\n");
+        L"           tools/latencybench/vac_registry.h と README.md を参照。\n"
+        L"  --loopback\n"
+        L"           VAC/VB-CABLE のような「録音側エンドポイントを別途持つ\n"
+        L"           ケーブル」ではなく、レンダー(仮想スピーカー)しか持たない\n"
+        L"           仮想デバイス(例: VirtualDrivers/Virtual-Audio-Driver)向け。\n"
+        L"           <render-name-substring> だけを使い、WASAPI loopback\n"
+        L"           capture(OS 標準機能)でそのレンダーエンドポイント自身を\n"
+        L"           録音側として測定する。<capture-name-substring> は無視\n"
+        L"           されるが引数としては必要(renderNameSubstr と同じ値を\n"
+        L"           渡せばよい)。accessMethod は wasapi_shared_loopback のみ\n"
+        L"           (排他モード・DirectKS は対象外)。\n");
 }
 
 void ListVirtualDevices() {
@@ -218,20 +248,24 @@ int wmain(int argc, wchar_t** argv) {
     std::wstring csvPath, jsonPath;
     int vacLineNumber = -1;
     std::vector<int> vacMsPerIntValues;  // 空なら未使用(gap 9: VAC 内部設定スイープ、実験的機能)
-    for (int i = 4; i + 1 < argc; ++i) {
-        if (wcscmp(argv[i], L"--csv") == 0) csvPath = argv[i + 1];
-        if (wcscmp(argv[i], L"--json") == 0) jsonPath = argv[i + 1];
-        if (wcscmp(argv[i], L"--vac-line") == 0) vacLineNumber = _wtoi(argv[i + 1]);
-        if (wcscmp(argv[i], L"--vac-ms-per-int") == 0) {
-            const std::wstring list = argv[i + 1];
-            size_t start = 0;
-            while (start <= list.size()) {
-                const size_t comma = list.find(L',', start);
-                const std::wstring token =
-                    list.substr(start, comma == std::wstring::npos ? std::wstring::npos : comma - start);
-                if (!token.empty()) vacMsPerIntValues.push_back(_wtoi(token.c_str()));
-                if (comma == std::wstring::npos) break;
-                start = comma + 1;
+    bool loopbackMode = false;  // --loopback: render エンドポイント自身を WASAPI loopback capture で拾う
+    for (int i = 4; i < argc; ++i) {
+        if (wcscmp(argv[i], L"--loopback") == 0) loopbackMode = true;
+        if (i + 1 < argc) {
+            if (wcscmp(argv[i], L"--csv") == 0) csvPath = argv[i + 1];
+            if (wcscmp(argv[i], L"--json") == 0) jsonPath = argv[i + 1];
+            if (wcscmp(argv[i], L"--vac-line") == 0) vacLineNumber = _wtoi(argv[i + 1]);
+            if (wcscmp(argv[i], L"--vac-ms-per-int") == 0) {
+                const std::wstring list = argv[i + 1];
+                size_t start = 0;
+                while (start <= list.size()) {
+                    const size_t comma = list.find(L',', start);
+                    const std::wstring token = list.substr(
+                        start, comma == std::wstring::npos ? std::wstring::npos : comma - start);
+                    if (!token.empty()) vacMsPerIntValues.push_back(_wtoi(token.c_str()));
+                    if (comma == std::wstring::npos) break;
+                    start = comma + 1;
+                }
             }
         }
     }
@@ -242,21 +276,32 @@ int wmain(int argc, wchar_t** argv) {
     }
 
     // レンダー/キャプチャエンドポイントを名前の部分一致で検索する。
+    // --loopback 指定時、captureNameSubstr(第2引数)はレンダー側の
+    // WASAPI loopback capture で代替するため使わない
+    // (CLI の位置引数の形はそのまま保つ。renderNameSubstr と同じ値を渡す
+    // 運用を README.md で案内)。
     std::wstring renderId, captureId;
     for (const auto& ep : wasapi::EnumerateEndpoints(/*isCapture=*/false))
         if (ep.name.find(renderNameSubstr) != std::wstring::npos) renderId = ep.id;
-    for (const auto& ep : wasapi::EnumerateEndpoints(/*isCapture=*/true))
-        if (ep.name.find(captureNameSubstr) != std::wstring::npos) captureId = ep.id;
+    if (!loopbackMode) {
+        for (const auto& ep : wasapi::EnumerateEndpoints(/*isCapture=*/true))
+            if (ep.name.find(captureNameSubstr) != std::wstring::npos) captureId = ep.id;
+    }
 
-    if (renderId.empty() || captureId.empty()) {
+    if (renderId.empty() || (!loopbackMode && captureId.empty())) {
         std::wprintf(L"device not found (render=\"%s\" capture=\"%s\")\n",
                      renderNameSubstr.c_str(), captureNameSubstr.c_str());
         return 1;
     }
 
     std::vector<uint32_t> bufferSizes = {64, 128, 256, 512};
-    std::vector<AccessMethod> methods = {AccessMethod::WasapiShared, AccessMethod::WasapiExclusive,
-                                         AccessMethod::DirectKs};
+    // --loopback: レンダーエンドポイント自身を WASAPI loopback capture で
+    // 拾う(排他モードは仕様上不可、DirectKS はそもそも別軸の話なので、
+    // このモードでは wasapi_shared_loopback だけを測定する)。
+    std::vector<AccessMethod> methods =
+        loopbackMode ? std::vector<AccessMethod>{AccessMethod::WasapiSharedLoopback}
+                     : std::vector<AccessMethod>{AccessMethod::WasapiShared, AccessMethod::WasapiExclusive,
+                                                 AccessMethod::DirectKs};
 
     std::vector<std::string> csvLines;
     csvLines.push_back(
@@ -318,6 +363,13 @@ int wmain(int argc, wchar_t** argv) {
                 if (method == AccessMethod::WasapiShared || method == AccessMethod::WasapiExclusive) {
                     renderDevice = std::make_unique<wasapi::WasapiDevice>(renderId, false);
                     captureDevice = std::make_unique<wasapi::WasapiDevice>(captureId, true);
+                } else if (method == AccessMethod::WasapiSharedLoopback) {
+                    // 同じ renderId を 2 つの独立した WASAPI クライアントで開く
+                    // (通常のレンダーと、loopback capture)。シェアードモードは
+                    // 複数クライアントの同時オープンを許すのでこれで成立する。
+                    renderDevice = std::make_unique<wasapi::WasapiDevice>(renderId, false);
+                    captureDevice = std::make_unique<wasapi::WasapiDevice>(renderId, /*isCapture=*/true,
+                                                                            /*loopback=*/true);
                 } else {
                     // DirectKS は WasapiDevice とは別列挙(SetupDiGetClassDevs)なので、
                     // 名前一致で該当フィルタを探す。

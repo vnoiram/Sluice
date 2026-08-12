@@ -25,6 +25,13 @@
 //   - デバイスのホットプラグは IMMNotificationClient で検知し、
 //     resetRequested を立てる(呼び出し側が Close→Open で作り直す。
 //     ASIO の kAsioResetRequest と同じ扱い)。
+//   - WASAPI loopback capture(AUDCLNT_STREAMFLAGS_LOOPBACK): レンダー
+//     エンドポイントに送られた音声をそのエンドポイント自身から録音できる
+//     OS 標準機能(対象オーディオドライバ側の対応は不要)。コンストラクタの
+//     loopback 引数で有効化する(docs/audio-router-implementation-gap.md
+//     gap 9: 録音側エンドポイントを別途持たない仮想デバイス — 例
+//     VirtualDrivers/Virtual-Audio-Driver — の実測用途)。仕様上シェアード
+//     モード専用(排他モードとは併用不可、Open() で拒否する)。
 //
 // 罠: WASAPI のバッファは常にインターリーブ(チャンネルごとに独立した
 // バッファではない)。IAudioDevice 契約はプレーナなので、キャプチャ時は
@@ -67,7 +74,20 @@ std::vector<EndpointInfo> EnumerateEndpoints(bool isCapture);
 class WasapiDevice : public IAudioDevice {
 public:
     // endpointId が空文字列なら既定デバイス(eConsole ロール)を使う。
-    WasapiDevice(std::wstring endpointId, bool isCapture);
+    //
+    // loopback=true(WASAPI loopback capture、Windows のオーディオエンジンが
+    // 標準で提供する機能で、対象ドライバ側の対応は不要): endpointId は
+    // レンダー(eRender)側エンドポイントを指し、そこへ再生された音声を
+    // キャプチャする。isCapture の値に関わらず(コンストラクタ内で
+    // isCapture_ = true に強制する)IAudioCaptureClient 経由で読む
+    // 通常のキャプチャデバイスとして振る舞う(CaptureRing() から読める)。
+    // WASAPI の仕様上、排他モード(DeviceStreamConfig::exclusiveMode)とは
+    // 併用できない(Open() で拒否する)。
+    //
+    // 用途: VAC/VB-CABLE のように録音側エンドポイントを別途持たない仮想
+    // オーディオドライバ(例: レンダー専用の仮想スピーカーのみを持つドライバ)
+    // の実測に使う。tools/latencybench の --loopback 参照。
+    WasapiDevice(std::wstring endpointId, bool isCapture, bool loopback = false);
     ~WasapiDevice() override { Close(); }
     WasapiDevice(const WasapiDevice&) = delete;
 
@@ -133,6 +153,7 @@ private:
 
     std::wstring endpointId_;
     bool isCapture_;
+    bool loopback_ = false;
 
     IMMDeviceEnumerator* enumerator_ = nullptr;
     IMMDevice* device_ = nullptr;
