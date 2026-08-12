@@ -386,7 +386,13 @@ int wmain(int argc, wchar_t** argv) {
                 std::wprintf(L"[vac] レジストリ書き込み失敗、この設定値をスキップ: %s\n", vacErr.c_str());
                 continue;
             }
-            if (!vac_registry::RestartDriverService(&vacErr)) {
+            // 実機検証で ControlService(SERVICE_CONTROL_STOP) が
+            // ERROR_INVALID_SERVICE_CONTROL(1052)で拒否されることを確認した
+            // ため、SCM のサービス制御(RestartDriverService)ではなく PnP
+            // デバイスの無効化→有効化(RestartDriverPnp)を使う
+            // (vac_registry.h のコメント参照。VAC ドライバ全体が対象になり、
+            // lineNumber 単位では絞り込めない)。
+            if (!vac_registry::RestartDriverPnp(&vacErr)) {
                 std::wprintf(L"[vac] ドライバ再起動失敗、この設定値をスキップ"
                             L"(VAC Control Panel の \"Restart Driver\" を手動で実行し、"
                             L"改めてこの値だけで再実行してください): %s\n",

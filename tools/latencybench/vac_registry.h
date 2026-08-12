@@ -47,6 +47,17 @@
 
 #include <windows.h>
 
+// GUID_DEVCLASS_MEDIA は DEFINE_GUID マクロで宣言されており、INITGUID
+// なしだと「宣言のみ」で未解決シンボルになる
+// (engine/device/ks_device.cpp が KSCATEGORY_AUDIO に対して行っているのと
+// 同じ理由。DECLSPEC_SELECTANY で定義されるため、複数の翻訳単位でそれぞれ
+// INITGUID 付きで include しても重複シンボルエラーにはならない)。
+#define INITGUID
+#include <devguid.h>
+#include <setupapi.h>
+#undef INITGUID
+
+#include <cwctype>
 #include <string>
 #include <vector>
 
@@ -228,6 +239,115 @@ inline bool RestartDriverService(std::wstring* err) {
     // ドライバ再初期化・デバイス列挙の再構築を待つための猶予(未検証の
     // 経験的な値。実機で足りなければ呼び出し側で追加のリトライを検討)。
     Sleep(300);
+    return true;
+}
+
+namespace detail {
+inline bool ContainsCaseInsensitive(const std::wstring& haystack, const std::wstring& needle) {
+    auto toUpper = [](std::wstring s) {
+        for (auto& c : s) c = (wchar_t)towupper(c);
+        return s;
+    };
+    return toUpper(haystack).find(toUpper(needle)) != std::wstring::npos;
+}
+}  // namespace detail
+
+// RestartDriverService の代替(実機で ControlService(SERVICE_CONTROL_STOP) が
+// ERROR_INVALID_SERVICE_CONTROL(1052)で拒否されることを実機で確認したため
+// 追加。VAC のドライバサービスは通常の Win32 サービスと違い SCM 経由の
+// Stop/Start に対応していない模様)。
+//
+// Device Manager の「デバイスの無効化→有効化」(devcon.exe の "restart" と
+// 同じ操作)を SetupDi の DIF_PROPERTYCHANGE/DICS_DISABLE/DICS_ENABLE で行う。
+// これは VAC ドライバのサービス制御ではなく PnP デバイスノードの制御なので、
+// STOP を実装していないドライバにも通常効く(Device Manager の GUI 操作と
+// 等価)。
+//
+// 制約(未検証):
+//   - VAC は複数ケーブルを 1 つの PnP デバイスインスタンスで扱う設計と
+//     見られる(ケーブル数がドライバ全体のレジストリパラメータであり、
+//     ケーブルごとの個別 PnP デバイスではないため)。そのためこの再起動は
+//     lineNumber 引数に関わらず VAC ドライバ全体(全ケーブル)に影響する
+//     ("Restart Driver" ボタンと同じ想定される粒度)。
+//   - デバイスの説明/フレンドリ名に "Virtual Audio Cable" を含むものを
+//     GUID_DEVCLASS_MEDIA(サウンド、ビデオ、およびゲーム コントローラー)
+//     クラスから検索する。VAC Lite でこの文字列が同じかどうかは未確認。
+//   - ドライバが実際に使用中の場合、無効化がエラーになる、または成功しても
+//     既に開いていた他アプリのストリームが切断される可能性がある。
+inline bool RestartDriverPnp(std::wstring* err) {
+    HDEVINFO devInfo = SetupDiGetClassDevsW(&GUID_DEVCLASS_MEDIA, nullptr, nullptr, DIGCF_PRESENT);
+    if (devInfo == INVALID_HANDLE_VALUE) {
+        if (err) *err = L"SetupDiGetClassDevsW(GUID_DEVCLASS_MEDIA) failed: " +
+                        std::to_wstring(GetLastError());
+        return false;
+    }
+
+    SP_DEVINFO_DATA devData{};
+    devData.cbSize = sizeof(devData);
+    bool found = false;
+    for (DWORD index = 0; SetupDiEnumDeviceInfo(devInfo, index, &devData); ++index) {
+        wchar_t nameBuf[256] = {};
+        DWORD nameSize = 0;
+        const bool gotName =
+            SetupDiGetDeviceRegistryPropertyW(devInfo, &devData, SPDRP_FRIENDLYNAME, nullptr,
+                                              (PBYTE)nameBuf, sizeof(nameBuf), &nameSize) ||
+            SetupDiGetDeviceRegistryPropertyW(devInfo, &devData, SPDRP_DEVICEDESC, nullptr,
+                                              (PBYTE)nameBuf, sizeof(nameBuf), &nameSize);
+        if (gotName && detail::ContainsCaseInsensitive(nameBuf, L"Virtual Audio Cable")) {
+            found = true;
+            break;
+        }
+    }
+
+    if (!found) {
+        SetupDiDestroyDeviceInfoList(devInfo);
+        if (err)
+            *err = L"GUID_DEVCLASS_MEDIA 内に \"Virtual Audio Cable\" を含むデバイスが"
+                  L"見つからない(VAC Lite で名称が異なる可能性)";
+        return false;
+    }
+
+    auto setState = [&](DWORD stateChange) -> bool {
+        SP_PROPCHANGE_PARAMS params{};
+        params.ClassInstallHeader.cbSize = sizeof(SP_CLASSINSTALL_HEADER);
+        params.ClassInstallHeader.InstallFunction = DIF_PROPERTYCHANGE;
+        params.StateChange = stateChange;
+        params.Scope = DICS_FLAG_GLOBAL;
+        params.HwProfile = 0;
+        if (!SetupDiSetClassInstallParamsW(devInfo, &devData, &params.ClassInstallHeader,
+                                           sizeof(params)))
+            return false;
+        return SetupDiCallClassInstaller(DIF_PROPERTYCHANGE, devInfo, &devData) != FALSE;
+    };
+
+    if (!setState(DICS_DISABLE)) {
+        const DWORD disableErr = GetLastError();
+        SetupDiDestroyDeviceInfoList(devInfo);
+        if (err) {
+            *err = L"device disable (DICS_DISABLE) failed: " + std::to_wstring(disableErr);
+            if (disableErr == ERROR_ACCESS_DENIED) *err += L" (管理者として実行してください)";
+        }
+        return false;
+    }
+
+    Sleep(500);  // 無効化が実際に完了するまでの経験的な猶予(未検証)。
+
+    if (!setState(DICS_ENABLE)) {
+        const DWORD enableErr = GetLastError();
+        SetupDiDestroyDeviceInfoList(devInfo);
+        if (err) {
+            *err = L"device enable (DICS_ENABLE) failed after disable: " +
+                  std::to_wstring(enableErr) +
+                  L" (デバイスが無効化されたまま残っている可能性。デバイスマネージャーで"
+                  L"手動で有効化を確認すること)";
+        }
+        return false;
+    }
+
+    SetupDiDestroyDeviceInfoList(devInfo);
+
+    // 再列挙・ドライバ再初期化を待つための猶予(未検証の経験的な値)。
+    Sleep(1000);
     return true;
 }
 
