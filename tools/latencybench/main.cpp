@@ -211,18 +211,44 @@ void PrintUsage() {
 }
 
 void ListVirtualDevices() {
+    bool foundHeuristic = false;
+
     auto vbCable = wasapi::DetectVbCable();
-    if (vbCable.virtualInput)
+    if (vbCable.virtualInput) {
         std::wprintf(L"VB-CABLE virtual input (capture) : %s\n", vbCable.virtualInput->name.c_str());
-    if (vbCable.virtualOutput)
+        foundHeuristic = true;
+    }
+    if (vbCable.virtualOutput) {
         std::wprintf(L"VB-CABLE virtual output (render) : %s\n",
                      vbCable.virtualOutput->name.c_str());
+        foundHeuristic = true;
+    }
 
     for (const auto& line : wasapi::DetectVac()) {
         std::wprintf(L"VAC Line %d:\n", line.lineNumber);
         if (line.capture) std::wprintf(L"  capture: %s\n", line.capture->name.c_str());
         if (line.render) std::wprintf(L"  render : %s\n", line.render->name.c_str());
+        foundHeuristic = true;
     }
+
+    if (!foundHeuristic) {
+        std::wprintf(L"(VB-CABLE/VAC らしき名前のデバイスは見つからなかった。"
+                    L"VirtualDrivers/Virtual-Audio-Driver のような他の仮想デバイスは"
+                    L"名前のパターンが違うため、以下の全デバイス一覧から探すこと。"
+                    L"見つけた名前をそのまま --sweep の引数に使えばよい。)\n");
+    }
+
+    // VAC/VB-CABLE の名前ヒューリスティックに一致しない仮想デバイス
+    // (VirtualDrivers/Virtual-Audio-Driver 等)は上のパターンマッチでは
+    // 拾えないため、実際に --sweep へ渡す名前を確認できるよう全デバイスも
+    // 併記する。
+    std::wprintf(L"\nすべての WASAPI レンダーエンドポイント:\n");
+    for (const auto& ep : wasapi::EnumerateEndpoints(/*isCapture=*/false))
+        std::wprintf(L"  %s\n", ep.name.c_str());
+
+    std::wprintf(L"\nすべての WASAPI キャプチャエンドポイント:\n");
+    for (const auto& ep : wasapi::EnumerateEndpoints(/*isCapture=*/true))
+        std::wprintf(L"  %s\n", ep.name.c_str());
 }
 
 }  // namespace
