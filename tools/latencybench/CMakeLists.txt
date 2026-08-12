@@ -39,7 +39,12 @@ if(BUILD_LATENCYBENCH)
     )
 
     if(MSVC)
-        target_compile_options(latencybench PRIVATE /W4 /permissive-)
+        # /utf-8: このファイルは UTF-8(BOM 無し)で保存されている。/utf-8 が
+        # 無いとビルド環境のアクティブコードページでソースを解釈するため、
+        # main.cpp 内の日本語ワイド文字列リテラル(--list の出力文言等)が
+        # 文字化けしたまま実行ファイルに埋め込まれる(実行時のロケール設定
+        # では直せない、コンパイル時の問題)。
+        target_compile_options(latencybench PRIVATE /W4 /permissive- /utf-8)
     endif()
 endif()
 

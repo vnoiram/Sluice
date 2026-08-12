@@ -52,7 +52,11 @@ if(BUILD_ASIO_HOST)
     )
 
     if(MSVC)
-        target_compile_options(sluice-engine PRIVATE /W4 /permissive-)
+        # /utf-8: ソースが UTF-8(BOM 無し)で保存されているため、ビルド環境の
+        # アクティブコードページでの誤解釈を防ぐ(tools/latencybench の同種の
+        # 問題を修正した際に判明。日本語ワイド文字列リテラルがあると特に影響
+        # が大きい)。
+        target_compile_options(sluice-engine PRIVATE /W4 /permissive- /utf-8)
         # 実装ガイド §3.2「Release は /O2 /fp:fast /arch:AVX2」。Release
         # 構成にのみ付ける(Debug は AVX2 を要求しないスカラー経路のまま。
         # graph/simd_mix.h の #if defined(__AVX2__) と対応)。/O2 と /fp:fast
