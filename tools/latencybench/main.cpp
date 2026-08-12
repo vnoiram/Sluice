@@ -254,6 +254,17 @@ void ListVirtualDevices() {
 }  // namespace
 
 int wmain(int argc, wchar_t** argv) {
+    // engine/main.cpp と同じ理由: EnumerateEndpoints/WasapiDevice/KsDevice が
+    // 呼ぶ CoCreateInstance 系 API は呼び出し側スレッドでの COM 初期化を
+    // 前提とする。これを忘れると CoCreateInstance が CO_E_NOTINITIALIZED で
+    // 静かに失敗し、EnumerateEndpoints が空の vector を返す
+    // (エラー出力なし)ため、--list が何も表示しないという分かりにくい
+    // 症状になる。
+    if (FAILED(CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED))) {
+        fwprintf(stderr, L"CoInitializeEx failed\n");
+        return 1;
+    }
+
     if (argc < 2) {
         PrintUsage();
         return 1;
