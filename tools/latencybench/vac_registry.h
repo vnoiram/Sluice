@@ -284,7 +284,12 @@ inline bool RestartDriverPnp(std::wstring* err) {
 
     SP_DEVINFO_DATA devData{};
     devData.cbSize = sizeof(devData);
+    SP_DEVINFO_DATA firstMatch{};
     bool found = false;
+    int matchCount = 0;
+    std::wstring matchedName;
+    // 全件数える(診断用: 複数一致していたら誤ったインスタンスを掴んでいる
+    // 可能性がある、という手がかりになる)ため break しない。
     for (DWORD index = 0; SetupDiEnumDeviceInfo(devInfo, index, &devData); ++index) {
         wchar_t nameBuf[256] = {};
         DWORD nameSize = 0;
@@ -294,10 +299,15 @@ inline bool RestartDriverPnp(std::wstring* err) {
             SetupDiGetDeviceRegistryPropertyW(devInfo, &devData, SPDRP_DEVICEDESC, nullptr,
                                               (PBYTE)nameBuf, sizeof(nameBuf), &nameSize);
         if (gotName && detail::ContainsCaseInsensitive(nameBuf, L"Virtual Audio Cable")) {
-            found = true;
-            break;
+            ++matchCount;
+            if (!found) {
+                found = true;
+                matchedName = nameBuf;
+                firstMatch = devData;
+            }
         }
     }
+    devData = firstMatch;
 
     if (!found) {
         SetupDiDestroyDeviceInfoList(devInfo);
@@ -307,7 +317,10 @@ inline bool RestartDriverPnp(std::wstring* err) {
         return false;
     }
 
-    auto setState = [&](DWORD stateChange) -> bool {
+    // どちらの API 呼び出しで失敗したかを区別できるよう、ラベル付きで返す
+    // (ERROR_INVALID_DATA 等の同じエラーコードでも、どちらの呼び出しで
+    // 出たかで原因の切り分けが変わる)。
+    auto setState = [&](DWORD stateChange, const wchar_t** failedCall) -> bool {
         SP_PROPCHANGE_PARAMS params{};
         params.ClassInstallHeader.cbSize = sizeof(SP_CLASSINSTALL_HEADER);
         params.ClassInstallHeader.InstallFunction = DIF_PROPERTYCHANGE;
@@ -315,32 +328,42 @@ inline bool RestartDriverPnp(std::wstring* err) {
         params.Scope = DICS_FLAG_GLOBAL;
         params.HwProfile = 0;
         if (!SetupDiSetClassInstallParamsW(devInfo, &devData, &params.ClassInstallHeader,
-                                           sizeof(params)))
+                                           sizeof(params))) {
+            *failedCall = L"SetupDiSetClassInstallParamsW";
             return false;
-        return SetupDiCallClassInstaller(DIF_PROPERTYCHANGE, devInfo, &devData) != FALSE;
+        }
+        if (!SetupDiCallClassInstaller(DIF_PROPERTYCHANGE, devInfo, &devData)) {
+            *failedCall = L"SetupDiCallClassInstaller";
+            return false;
+        }
+        return true;
     };
 
-    if (!setState(DICS_DISABLE)) {
+    auto describeFailure = [&](const wchar_t* action, const wchar_t* failedCall, DWORD code) {
+        std::wstring msg = std::wstring(action) + L" (" + failedCall + L") failed: " +
+                           std::to_wstring(code) + L" [matched " + std::to_wstring(matchCount) +
+                           L" device(s), using \"" + matchedName + L"\"]";
+        if (code == ERROR_ACCESS_DENIED) msg += L" (管理者として実行してください)";
+        return msg;
+    };
+
+    const wchar_t* failedCall = L"";
+    if (!setState(DICS_DISABLE, &failedCall)) {
         const DWORD disableErr = GetLastError();
         SetupDiDestroyDeviceInfoList(devInfo);
-        if (err) {
-            *err = L"device disable (DICS_DISABLE) failed: " + std::to_wstring(disableErr);
-            if (disableErr == ERROR_ACCESS_DENIED) *err += L" (管理者として実行してください)";
-        }
+        if (err) *err = describeFailure(L"disable", failedCall, disableErr);
         return false;
     }
 
     Sleep(500);  // 無効化が実際に完了するまでの経験的な猶予(未検証)。
 
-    if (!setState(DICS_ENABLE)) {
+    if (!setState(DICS_ENABLE, &failedCall)) {
         const DWORD enableErr = GetLastError();
         SetupDiDestroyDeviceInfoList(devInfo);
-        if (err) {
-            *err = L"device enable (DICS_ENABLE) failed after disable: " +
-                  std::to_wstring(enableErr) +
+        if (err)
+            *err = describeFailure(L"enable(after disable)", failedCall, enableErr) +
                   L" (デバイスが無効化されたまま残っている可能性。デバイスマネージャーで"
                   L"手動で有効化を確認すること)";
-        }
         return false;
     }
 
