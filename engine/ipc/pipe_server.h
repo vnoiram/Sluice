@@ -35,10 +35,17 @@
 #include <vector>
 
 #include "ipc/json_value.h"
+#include "../../vasio/shared_security.h"
 
 namespace ipc {
 
 using MethodHandler = std::function<JsonValue(const JsonValue& params)>;
+
+// 受信行の上限(このサイズを超えて改行が来ない場合は切断する。DoS対策)。
+// 既存のパイプ入出力バッファサイズ(65536)に合わせる。
+constexpr size_t kMaxLineBytes = 65536;
+// アイドル読み取りタイムアウト(接続済みのまま無言のクライアントを切断する)。
+constexpr DWORD kIdleReadTimeoutMs = 30000;
 
 class PipeServer {
 public:
@@ -95,9 +102,14 @@ private:
 
     void AcceptLoop() {
         while (running_.load(std::memory_order_relaxed)) {
+            // 現在ユーザーのみ接続可能な DACL を付与する(既定 DACL のままだと
+            // ローカルの任意の認証済みユーザーが set_param 等の変更系メソッドを
+            // 呼べてしまう)。PIPE_REJECT_REMOTE_CLIENTS も併せて指定し、SMB
+            // 経由のリモート接続の可能性を明示的に遮断する。
             HANDLE pipe = CreateNamedPipeW(
                 pipeName_.c_str(), PIPE_ACCESS_DUPLEX | FILE_FLAG_OVERLAPPED,
-                PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT, 1, 65536, 65536, 0, nullptr);
+                PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT | PIPE_REJECT_REMOTE_CLIENTS, 1,
+                65536, 65536, 0, pipeSecurity_.attributes());
             if (pipe == INVALID_HANDLE_VALUE) break;
 
             HANDLE connectEvent = CreateEventW(nullptr, TRUE, FALSE, nullptr);
@@ -163,7 +175,7 @@ private:
             }
 
             HANDLE waitHandles[3] = { stopEvent_, readEvent, notifyEvent };
-            DWORD wait = WaitForMultipleObjects(3, waitHandles, FALSE, INFINITE);
+            DWORD wait = WaitForMultipleObjects(3, waitHandles, FALSE, kIdleReadTimeoutMs);
 
             if (wait == WAIT_OBJECT_0) {
                 break;  // サーバ停止
@@ -173,6 +185,9 @@ private:
                     break;
                 readPending = false;
                 buffer.append(chunk, readBytes);
+                if (buffer.size() > kMaxLineBytes) {
+                    break;  // プロトコル上限超過: 切断(DoS対策)
+                }
                 size_t pos;
                 while ((pos = buffer.find('\n')) != std::string::npos) {
                     std::string line = buffer.substr(0, pos);
@@ -189,6 +204,8 @@ private:
                 for (const auto& msg : toSend) {
                     if (!WriteLineOverlapped(pipe, writeEvent, msg)) { ok = false; break; }
                 }
+            } else if (wait == WAIT_TIMEOUT) {
+                break;  // アイドルタイムアウト: 無言のクライアントを切断(DoS対策)
             } else {
                 break;  // エラー
             }
@@ -250,6 +267,8 @@ private:
 
     std::mutex clientMutex_;
     HANDLE clientNotifyEvent_ = nullptr;  // 現在接続中のクライアントの ServeClient が待つイベント
+
+    vasio::CurrentUserOnlySecurityAttributes pipeSecurity_;
 };
 
 }  // namespace ipc
