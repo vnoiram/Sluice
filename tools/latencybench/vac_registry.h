@@ -22,9 +22,22 @@
 //     ここでは一致する前提で実装している。
 //   - サービス名の "VirtualAudioCable_" 接頭辞・GUID 部分がバージョン間で
 //     安定しているかどうか(トラブルシューティングページの例 1 件のみが
-//     根拠)。ここでは前方一致で検索する。
+//     根拠)。ここでは前方一致で検索する。実機での初回検証時、この前方
+//     一致に一致するサービスが実際に見つかるかどうかも含めて未確認
+//     (見つからなければ ERROR_SERVICE_DOES_NOT_EXIST 相当のエラーになる
+//     はずだが、ControlService/StartServiceW 自体のエラーコードで判別する
+//     設計にしてある)。
 //   - サービスの Stop/Start が、マニュアルが案内する VAC Control Panel の
-//     "Restart Driver" 機能と同等に新しい値を反映するかどうか。
+//     "Restart Driver" 機能と同等に新しい値を反映するかどうか。追加調査で、
+//     マニュアル本文には「"Restarting System Audio Service"(Windows Audio
+//     サービス自体の再起動)」という表現が Control Panel の操作として
+//     出てくることが分かった ── これが事実なら、VAC 自身のドライバサービス
+//     ではなく OS の "Audiosrv"(Windows Audio)サービスを再起動するのが
+//     正しい経路である可能性がある(未確定。ただし影響範囲が PC 全体の
+//     オーディオに広がるため、実装を変更する前に実機での実際のエラーを
+//     見て判断すること)。
+//   - VAC には Lite 版があり(複数ケーブルの本数制限など機能が絞られる)、
+//     レジストリレイアウト・サービス名がフル版と同一かどうかは未確認。
 //
 // そのため、この機能は latencybench 側で明示的にフラグを指定した場合のみ
 // 使う実験的機能として扱う。失敗時(レジストリアクセス拒否・サービスが
@@ -146,33 +159,71 @@ inline bool RestartDriverService(std::wstring* err) {
         return false;
     }
 
-    SERVICE_STATUS status;
-    ControlService(svc, SERVICE_CONTROL_STOP, &status);
-    bool stopped = false;
-    for (int i = 0; i < 50; ++i) {
-        if (!QueryServiceStatus(svc, &status)) break;
-        if (status.dwCurrentState == SERVICE_STOPPED) {
-            stopped = true;
-            break;
+    SERVICE_STATUS status{};
+    if (!QueryServiceStatus(svc, &status)) {
+        CloseServiceHandle(svc);
+        CloseServiceHandle(scm);
+        if (err)
+            *err = L"QueryServiceStatus(" + serviceName +
+                  L") failed before stop: " + std::to_wstring(GetLastError());
+        return false;
+    }
+
+    bool stopped = (status.dwCurrentState == SERVICE_STOPPED);
+    if (!stopped) {
+        // ControlService の戻り値を必ず見る。WDM/PnP 系のドライバサービスは
+        // 通常の Win32 サービスと違い、そもそも SERVICE_CONTROL_STOP を
+        // 受理しない(ERROR_INVALID_SERVICE_CONTROL)、依存関係で拒否される
+        // (ERROR_DEPENDENT_SERVICES_RUNNING)等の理由で、単なるタイムアウト
+        // 待ちでは原因が分からない(vac_registry.h 冒頭のコメント参照:
+        // VAC Control Panel の "Restart Driver" と同等かどうかは未検証)。
+        if (!ControlService(svc, SERVICE_CONTROL_STOP, &status)) {
+            const DWORD stopErr = GetLastError();
+            CloseServiceHandle(svc);
+            CloseServiceHandle(scm);
+            if (err) {
+                *err = L"ControlService(" + serviceName +
+                      L", SERVICE_CONTROL_STOP) failed: " + std::to_wstring(stopErr);
+                if (stopErr == ERROR_ACCESS_DENIED) *err += L" (管理者として実行してください)";
+                if (stopErr == ERROR_DEPENDENT_SERVICES_RUNNING)
+                    *err += L" (このドライバに依存する何かが起動中。オーディオを"
+                           L"使っているアプリを全て閉じてから再試行を)";
+                if (stopErr == ERROR_INVALID_SERVICE_CONTROL)
+                    *err += L" (このドライバは STOP 制御コード自体を受理しない設計の"
+                           L"可能性が高い。SCM 経由の再起動は使えず、VAC Control Panel の"
+                           L"\"Restart Driver\" を手動で使うしかないかもしれない)";
+            }
+            return false;
         }
-        Sleep(100);
+        for (int i = 0; i < 50; ++i) {
+            if (!QueryServiceStatus(svc, &status)) break;
+            if (status.dwCurrentState == SERVICE_STOPPED) {
+                stopped = true;
+                break;
+            }
+            Sleep(100);
+        }
     }
     if (!stopped) {
         CloseServiceHandle(svc);
         CloseServiceHandle(scm);
         if (err)
-            *err = L"service " + serviceName + L" did not reach SERVICE_STOPPED within timeout";
+            *err = L"service " + serviceName +
+                  L" did not reach SERVICE_STOPPED within timeout (last state=" +
+                  std::to_wstring(status.dwCurrentState) + L")";
         return false;
     }
 
-    const bool started = StartServiceW(svc, 0, nullptr) != 0;
+    if (!StartServiceW(svc, 0, nullptr)) {
+        const DWORD startErr = GetLastError();
+        CloseServiceHandle(svc);
+        CloseServiceHandle(scm);
+        if (err)
+            *err = L"StartServiceW(" + serviceName + L") failed: " + std::to_wstring(startErr);
+        return false;
+    }
     CloseServiceHandle(svc);
     CloseServiceHandle(scm);
-
-    if (!started) {
-        if (err) *err = L"StartServiceW(" + serviceName + L") failed: " + std::to_wstring(GetLastError());
-        return false;
-    }
 
     // ドライバ再初期化・デバイス列挙の再構築を待つための猶予(未検証の
     // 経験的な値。実機で足りなければ呼び出し側で追加のリトライを検討)。
