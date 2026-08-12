@@ -4,6 +4,8 @@
 
 #include <new>
 
+#include "../../vasio/shared_security.h"
+
 namespace vasiobridge {
 
 DeviceCaps VasioBridgeDevice::Probe(double /*sampleRate*/) {
@@ -18,7 +20,13 @@ DeviceCaps VasioBridgeDevice::Probe(double /*sampleRate*/) {
 bool VasioBridgeDevice::ConnectSharedMemory(std::wstring* errorOut) {
     layout_ = vasio::ComputeLayout(vasio::kDefaultRingCapacityFrames);
 
-    mapping_ = CreateFileMappingW(INVALID_HANDLE_VALUE, nullptr, PAGE_READWRITE, 0,
+    // 同一セッションの他プロセスが Local\SluiceVasio.<id> を先回りして
+    // 作成/汚染できないよう、現在ユーザーのみアクセス可な DACL を付与する
+    // (vasio_driver.cpp 側も同じ shared_security.h で構築するため、
+    // どちらが先に作成しても同じ制限になる)。
+    vasio::CurrentUserOnlySecurityAttributes security;
+
+    mapping_ = CreateFileMappingW(INVALID_HANDLE_VALUE, security.attributes(), PAGE_READWRITE, 0,
                                   static_cast<DWORD>(layout_.totalBytes),
                                   vasio::MappingName(instanceId_).c_str());
     if (!mapping_) {
@@ -39,7 +47,7 @@ bool VasioBridgeDevice::ConnectSharedMemory(std::wstring* errorOut) {
         return false;
     }
 
-    readyEvent_ = CreateEventW(nullptr, /*bManualReset=*/FALSE, /*bInitialState=*/FALSE,
+    readyEvent_ = CreateEventW(security.attributes(), /*bManualReset=*/FALSE, /*bInitialState=*/FALSE,
                                vasio::ReadyEventName(instanceId_).c_str());
     if (!readyEvent_) {
         if (errorOut) *errorOut = L"CreateEvent(vasio ready event) failed";
@@ -62,6 +70,19 @@ bool VasioBridgeDevice::ConnectSharedMemory(std::wstring* errorOut) {
         for (int i = 0; i < 2 * vasio::kMaxChannels; ++i)
             new (&ringHeaders[i]) vasio::ChannelRingHeader();
         control->ringCapacityFrames = vasio::kDefaultRingCapacityFrames;
+    }
+
+    // 相手側(vasio.dll)が先に接続していた場合、そのプロセスが書き込んだ
+    // フィールドを使う前に検証する(悪意ある/破損したピアからの防御)。
+    if (!vasio::ValidateControlBlock(*control, vasio::kDefaultRingCapacityFrames)) {
+        if (errorOut) *errorOut = L"vasio shared memory: control block validation failed";
+        CloseHandle(readyEvent_);
+        readyEvent_ = nullptr;
+        UnmapViewOfFile(mappedBase_);
+        mappedBase_ = nullptr;
+        CloseHandle(mapping_);
+        mapping_ = nullptr;
+        return false;
     }
 
     return true;
@@ -174,7 +195,10 @@ void VasioBridgeDevice::PumpSharedMemory(int frames) {
 
     auto* control = reinterpret_cast<vasio::SharedControlBlock*>(mappedBase_);
     const uint32_t cap = control->ringCapacityFrames;
-    if (cap == 0) return;  // 相手がまだ接続していない(レイアウト未確定)
+    // 接続時点の検証だけでなく毎回チェックする: 相手がまだ接続していない
+    // (レイアウト未確定)場合に加え、接続後に不正な値へ書き換えられた
+    // 場合もマッピング済み領域外へのポインタ演算を防ぐ。
+    if (cap != vasio::kDefaultRingCapacityFrames) return;
 
     auto* ringHeaders = reinterpret_cast<vasio::ChannelRingHeader*>(
         static_cast<uint8_t*>(mappedBase_) + layout_.RingHeaderOffset());

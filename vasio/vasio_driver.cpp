@@ -13,6 +13,7 @@
 #include <cstring>
 
 #include "../asio-abi/asio_registry.h"
+#include "shared_security.h"
 
 namespace {
 
@@ -147,9 +148,21 @@ bool SluiceVasioDriver::ConnectSharedMemory() {
     layout_ = vasio::ComputeLayout(kRingCapacityFrames);
 
     const std::wstring instanceId = ResolveInstanceIdFromEnvironment();
-    mapping_ = CreateFileMappingW(INVALID_HANDLE_VALUE, nullptr, PAGE_READWRITE, 0,
+
+    // 同一セッションの他プロセスが Local\SluiceVasio.<id> を先回りして
+    // 作成/汚染できないよう、現在ユーザーのみアクセス可な DACL を付与する
+    // (vasio_bridge_device.cpp 側も同じ shared_security.h で構築するため、
+    // どちらが先に作成しても同じ制限になる)。
+    vasio::CurrentUserOnlySecurityAttributes security;
+
+    mapping_ = CreateFileMappingW(INVALID_HANDLE_VALUE, security.attributes(), PAGE_READWRITE, 0,
                                    static_cast<DWORD>(layout_.totalBytes),
                                    vasio::MappingName(instanceId).c_str());
+    // CreateFileMappingW 直後でなければならない(次の Win32 呼び出しで
+    // 上書きされるため)。以前はこの取得を省略しており、後続の
+    // MapViewOfFile/CreateEventW が上書きした値で ERROR_ALREADY_EXISTS を
+    // 誤判定するバグがあった。
+    const DWORD createErr = GetLastError();
     if (!mapping_) return false;
 
     mappedView_ = MapViewOfFile(mapping_, FILE_MAP_ALL_ACCESS, 0, 0, layout_.totalBytes);
@@ -159,7 +172,8 @@ bool SluiceVasioDriver::ConnectSharedMemory() {
         return false;
     }
 
-    readyEvent_ = CreateEventW(nullptr, FALSE, FALSE, vasio::ReadyEventName(instanceId).c_str());
+    readyEvent_ = CreateEventW(security.attributes(), FALSE, FALSE,
+                                vasio::ReadyEventName(instanceId).c_str());
     if (!readyEvent_) {
         UnmapViewOfFile(mappedView_);
         mappedView_ = nullptr;
@@ -174,15 +188,22 @@ bool SluiceVasioDriver::ConnectSharedMemory() {
         reinterpret_cast<vasio::ChannelRingHeader*>(base + layout_.RingHeaderOffset());
     ringData_ = reinterpret_cast<float*>(base + layout_.RingDataOffset());
 
-    // CreateFileMapping が新規作成した場合(GetLastError() != ERROR_ALREADY_EXISTS)は
+    // CreateFileMapping が新規作成した場合(createErr != ERROR_ALREADY_EXISTS)は
     // control_ 内の atomic/POD が未初期化のゼロクリアされたページなので、明示的に
     // プレースメント new でコンストラクタを走らせる(std::atomic のデフォルト値・
     // ChannelRingHeader のデフォルト値を確定させるため)。既に engine プロセスが
     // 先に開いていた場合は上書きしない。
-    if (GetLastError() != ERROR_ALREADY_EXISTS) {
+    if (createErr != ERROR_ALREADY_EXISTS) {
         new (control_) vasio::SharedControlBlock();
         for (int i = 0; i < 2 * vasio::kMaxChannels; ++i) new (&ringHeaders_[i]) vasio::ChannelRingHeader();
         control_->ringCapacityFrames = kRingCapacityFrames;
+    }
+
+    // 相手側(engine)が先に接続していた場合、そのプロセスが書き込んだ
+    // フィールドを使う前に検証する(悪意ある/破損したピアからの防御)。
+    if (!vasio::ValidateControlBlock(*control_, kRingCapacityFrames)) {
+        DisconnectSharedMemory();
+        return false;
     }
 
     return true;
@@ -235,6 +256,14 @@ void SluiceVasioDriver::PumpOneBuffer() {
         control_->connectionState.load(std::memory_order_acquire) !=
             static_cast<uint32_t>(vasio::ConnectionState::Disconnected);
 
+    // リング領域へアクセスしてよいのは、接続時に検証したレイアウトと
+    // ringCapacityFrames が一致している場合のみ(相手が接続後に不正な値へ
+    // 書き換えた場合の防御。cap==0 のゼロ除算も RingRead/RingWrite 側で
+    // ガードしているが、ここではマッピング済み領域外へのオフセット計算
+    // 自体を避ける)。
+    const bool ringUsable =
+        engineConnected && control_->ringCapacityFrames == vasio::kDefaultRingCapacityFrames;
+
     // resetPending は「次のバッファ交換の直前」に通知する(実装ガイド §8.1 手順6:
     // 「エンジン側でレートやバッファサイズが変わったら vasio が DAW にリセットを
     // 要求する」)。一度通知したら resetNotified_ で多重送出を防ぐ。
@@ -259,7 +288,7 @@ void SluiceVasioDriver::PumpOneBuffer() {
     for (long i = 0; i < activeInputs_; ++i) {
         float* dst = inputBuffers_[i] + (toggle_ ? blockFrames_ : 0);
         uint32_t got = 0;
-        if (engineConnected) {
+        if (ringUsable) {
             const int channelIndex = vasio::kMaxChannels + static_cast<int>(inMap_[i]);
             got = vasio::RingRead(ringHeaders_[channelIndex],
                                    ringData_ + static_cast<size_t>(channelIndex) *
@@ -273,7 +302,7 @@ void SluiceVasioDriver::PumpOneBuffer() {
     // ToEngine (DAW→エンジン、ASIO 的には「出力」) をリングへ書き出す。
     for (long i = 0; i < activeOutputs_; ++i) {
         const float* src = outputBuffers_[i] + (toggle_ ? blockFrames_ : 0);
-        if (engineConnected) {
+        if (ringUsable) {
             const int channelIndex = static_cast<int>(outMap_[i]);
             vasio::RingWrite(ringHeaders_[channelIndex],
                               ringData_ + static_cast<size_t>(channelIndex) *

@@ -97,12 +97,71 @@ static void TestInstanceNaming() {
     CHECK(vasio::MappingName(L"1") != vasio::MappingName(L"2"));
 }
 
+// SharedControlBlock は std::atomic メンバを持つためコピー/ムーブ不可。
+// 各ケースごとに個別のインスタンスを組み立て、既定値から 1 フィールドだけ
+// 壊す形にする(共有メモリ上の実際の使われ方 = プレースメント new 後に
+// フィールドへ直接書き込む、と同じ組み立て方)。
+static void SetValidFields(vasio::SharedControlBlock& control) {
+    control.ringCapacityFrames = vasio::kDefaultRingCapacityFrames;
+    control.toEngineChannels = vasio::kMaxChannels;
+    control.fromEngineChannels = vasio::kMaxChannels;
+}
+
+static void TestValidateControlBlock() {
+    {
+        vasio::SharedControlBlock control;
+        SetValidFields(control);
+        CHECK(vasio::ValidateControlBlock(control, vasio::kDefaultRingCapacityFrames));
+    }
+    {
+        vasio::SharedControlBlock badVersion;
+        SetValidFields(badVersion);
+        badVersion.protocolVersion = vasio::kProtocolVersion + 1;
+        CHECK(!vasio::ValidateControlBlock(badVersion, vasio::kDefaultRingCapacityFrames));
+    }
+    {
+        vasio::SharedControlBlock badCapacity;
+        SetValidFields(badCapacity);
+        badCapacity.ringCapacityFrames = vasio::kDefaultRingCapacityFrames + 1;
+        CHECK(!vasio::ValidateControlBlock(badCapacity, vasio::kDefaultRingCapacityFrames));
+    }
+    {
+        vasio::SharedControlBlock badToChannels;
+        SetValidFields(badToChannels);
+        badToChannels.toEngineChannels = vasio::kMaxChannels + 1;
+        CHECK(!vasio::ValidateControlBlock(badToChannels, vasio::kDefaultRingCapacityFrames));
+    }
+    {
+        vasio::SharedControlBlock badFromChannels;
+        SetValidFields(badFromChannels);
+        badFromChannels.fromEngineChannels = vasio::kMaxChannels + 1;
+        CHECK(!vasio::ValidateControlBlock(badFromChannels, vasio::kDefaultRingCapacityFrames));
+    }
+}
+
+// capacityFrames == 0 は不正なレイアウト(相手が未接続、または破損)を示す。
+// mod 演算のゼロ除算 UB を起こさず、単に何もしないことを確認する。
+static void TestRingZeroCapacityGuard() {
+    vasio::ChannelRingHeader hdr;
+    float dummy[1] = {0.0f};
+    float src[1] = {42.0f};
+    float dst[1] = {0.0f};
+
+    uint32_t written = vasio::RingWrite(hdr, dummy, /*capacityFrames=*/0, src, 1);
+    CHECK(written == 0);
+
+    uint32_t read = vasio::RingRead(hdr, dummy, /*capacityFrames=*/0, dst, 1);
+    CHECK(read == 0);
+}
+
 int main() {
     TestLayoutSizes();
     TestRingRoundTrip();
     TestRingWrapAround();
     TestRingBackpressure();
     TestInstanceNaming();
+    TestValidateControlBlock();
+    TestRingZeroCapacityGuard();
     std::printf("test_shared_protocol: OK\n");
     return 0;
 }

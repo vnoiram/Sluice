@@ -93,6 +93,20 @@ struct SharedControlBlock {
                   "共有メモリ越しに使うので lock-free でなければならない");
 };
 
+// 共有メモリを開いた側が、値を信頼する前に検証する(同一セッションの
+// 悪意あるプロセスが先に Local\SluiceVasio.<id> を作成/汚染した場合の防御)。
+// expectedRingCapacityFrames は「呼び出し側が実際にマッピングをサイズした
+// ときの値」(通常 kDefaultRingCapacityFrames)。一致しない場合、
+// ringCapacityFrames を使ったポインタ演算がマップ済み領域の外を指しうる。
+inline bool ValidateControlBlock(const SharedControlBlock& control,
+                                  uint32_t expectedRingCapacityFrames) {
+    if (control.protocolVersion != kProtocolVersion) return false;
+    if (control.ringCapacityFrames != expectedRingCapacityFrames) return false;
+    if (control.toEngineChannels > static_cast<uint32_t>(kMaxChannels)) return false;
+    if (control.fromEngineChannels > static_cast<uint32_t>(kMaxChannels)) return false;
+    return true;
+}
+
 // 共有メモリ全体のバイトレイアウト。
 //   [0, controlBlockBytes)                                : SharedControlBlock
 //   [controlBlockBytes, controlBlockBytes+ringHeaderBytes) : ChannelRingHeader × 2*kMaxChannels
@@ -150,6 +164,7 @@ inline std::wstring ReadyEventName(const std::wstring& instanceId = L"0") {
 
 inline uint32_t RingWrite(ChannelRingHeader& hdr, float* ringBase, uint32_t capacityFrames,
                            const float* src, uint32_t n) {
+    if (capacityFrames == 0) return 0;  // 不正レイアウト: ゼロ除算/UB を避ける
     const uint32_t w = hdr.writePos.load(std::memory_order_relaxed);
     const uint32_t r = hdr.readPos.load(std::memory_order_acquire);
     const uint32_t used = w - r;
@@ -162,6 +177,7 @@ inline uint32_t RingWrite(ChannelRingHeader& hdr, float* ringBase, uint32_t capa
 
 inline uint32_t RingRead(ChannelRingHeader& hdr, const float* ringBase, uint32_t capacityFrames,
                           float* dst, uint32_t n) {
+    if (capacityFrames == 0) return 0;  // 不正レイアウト: ゼロ除算/UB を避ける
     const uint32_t r = hdr.readPos.load(std::memory_order_relaxed);
     const uint32_t w = hdr.writePos.load(std::memory_order_acquire);
     uint32_t available = w - r;
