@@ -58,7 +58,8 @@ ui/
 vasio/             仮想 ASIO ドライバ(vasio.dll, Phase 2)。DAW から見える
                    COM ドライバ本体・共有メモリプロトコル・オフラインテスト
                    (詳細は vasio/README.md)。engine 側の共有メモリ
-                   コンシューマ実装は未着手。
+                   コンシューマは engine/device/vasio_bridge_device.h/.cpp
+                   に実装済み(Windows実機/実DAWでの接続確認は未実施)。
 tools/latencybench/  仮想デバイス実測ベンチマークツール(実装ガイド §7.3)。
                    M 系列再生+相互相関で往復レイテンシを測定する
                    (詳細は tools/latencybench/README.md)。

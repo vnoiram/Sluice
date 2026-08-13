@@ -209,15 +209,15 @@ Windows コンテナでは常に `sluice-engine.exe` の実ビルドとコアテ
 - デバイス構成はプロセス起動時の CLI 引数で固定する。実行中に新規デバイスを
   追加する IPC は無い(`add_strip`/`remove_strip` は「既に開いている
   デバイスのチャンネル」に対するストリップの増減のみ)
-- マスタークロック以外の出力デバイスはドリフト補正されない
-  (`InputBoundary`/ASRC は入力側にしか無い、`main.cpp` 冒頭コメント参照)。
-  複数の出力デバイスを使う構成では、マスター以外の出力デバイスのクロックが
-  ずれると長時間で xrun しうる。対称な「出力バウンダリ」の実装は将来課題
-- サンプル型は Int32LSB / Float32LSB のみ対応(他はエラー表示)
+- マスター以外の出力デバイスも `graph/engine_graph.h` の `OutputBoundary`
+  (`InputBoundary` と対称、`dsp/drift.h` の `AsrcWriter` を使用)でドリフト
+  補正される
+- ASIO サンプル型は Int32LSB / Float32LSB に加え Int24LSB / Int16LSB にも
+  対応(`device/asio_host.cpp` 参照)
 - kAsioResetRequest(および WASAPI/KS の resetRequested)は「全体を作り直す」
   最単純対応。個々のデバイスだけを差し替える部分再構築は行わない
-- ドライバ操作は main スレッド(STA)で実施。製品版ではドライバごとの
-  管理スレッドに分離する(実装ガイド §4.1.2)
+- ASIO ドライバ操作はドライバごとに専用の管理スレッド(`device/sta_thread.h`
+  の `StaThread`)で実施する
 - KS バックエンドは Windows 実機でのコンパイル・動作検証が未実施
   (`device/ks_device.h` 冒頭コメント参照)
 
