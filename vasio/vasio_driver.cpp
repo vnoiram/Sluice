@@ -275,8 +275,9 @@ void SluiceVasioDriver::PumpOneBuffer() {
             resetNotified_ = true;
             // 送出済みを示すため Connected へ戻す(vasio_driver.h コメント参照)。
             // engine 側は「ResetPending を書いた後、値が Connected に戻ったら
-            // 送出済み」と解釈できる(engine 側コンシューマは本フェーズ未実装だが、
-            // 将来の実装がこの単純な合意に乗れるよう、ここで確定させておく)。
+            // 送出済み」と解釈できる(engine 側コンシューマ
+            // VasioBridgeDevice::RequestDawReset() が実際にこの合意に乗って
+            // 動作している。vasio_bridge_device.cpp 参照)。
             control_->connectionState.store(static_cast<uint32_t>(vasio::ConnectionState::Connected),
                                              std::memory_order_release);
         }

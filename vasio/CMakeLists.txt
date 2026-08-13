@@ -49,4 +49,10 @@ endif()
 if(BUILD_TESTS)
     enable_testing()
     add_subdirectory(tests)
+
+    # asio-abi/tests は Windows の COM 型(REFIID/HRESULT 等)に依存するため
+    # Windows でのみビルドする(asio-abi/tests/CMakeLists.txt 参照)。
+    if(WIN32)
+        add_subdirectory("${ASIO_ABI_DIR}/tests" "${CMAKE_BINARY_DIR}/asio_abi_tests")
+    endif()
 endif()

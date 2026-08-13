@@ -5,14 +5,14 @@
 // vasio.dll は DAW から見れば「ただの ASIO ドライバ」だが、実体は engine プロセスへの
 // 橋渡しでしかない。音声データそのものは CreateFileMapping による共有メモリ上の
 // リングバッファで受け渡す(制御はここ、実際のオープン/マップ処理は vasio_driver.cpp
-// および将来の engine 側コンシューマがそれぞれ行う)。
+// および engine/device/vasio_bridge_device.cpp のコンシューマがそれぞれ行う)。
 //
 // 命名規約:
 //   マッピングオブジェクト名: "Local\\SluiceVasio.<instanceId>"
 //   準備完了イベント名(エンジン→vasio): "Local\\SluiceVasioReady.<instanceId>"
-//   instanceId はドライバインスタンスごとに一意な文字列。既定運用では固定 "0" のみ
-//   (複数 vasio インスタンス対応は将来課題、実装ガイド §8.1 は既定 8in/8out 単一
-//   インスタンスを前提としている)。
+//   instanceId はドライバインスタンスごとに一意な文字列。既定運用では固定 "0" だが、
+//   gap 11 で複数インスタンス対応済み(vasio.dll 側は環境変数
+//   SLUICE_VASIO_INSTANCE、engine 側は main.cpp の --vasio-instance で指定する)。
 //
 // 同期(実装ガイド §8.1 手順4):
 //   エンジン側のマスタークロックが SetEvent する準備完了イベントを vasio 側が
