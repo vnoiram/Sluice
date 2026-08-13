@@ -64,9 +64,19 @@ public:
         handlers_[name] = std::move(handler);
     }
 
-    void Start() {
+    // 最初の CreateNamedPipeW は呼び出し元スレッドで同期的に実行し、
+    // FILE_FLAG_FIRST_PIPE_INSTANCE を付与する。engine 起動前に悪意ある
+    // プロセスが同名のパイプを先に作成していた場合(なりすまし/squatting)、
+    // ここで ERROR_ACCESS_DENIED により起動時に検知できる(従来は
+    // AcceptLoop が無言でスレッドを終了するだけで、engine は IPC が
+    // 死んだまま動き続けていた)。成功した場合のみバックグラウンドスレッドを
+    // 開始し、その最初の1個目のパイプインスタンスをそのまま引き継がせる。
+    bool Start() {
+        HANDLE firstPipe = CreatePipeInstance(/*firstInstance=*/true);
+        if (firstPipe == INVALID_HANDLE_VALUE) return false;
         running_.store(true);
-        thread_ = std::thread(&PipeServer::AcceptLoop, this);
+        thread_ = std::thread(&PipeServer::AcceptLoop, this, firstPipe);
+        return true;
     }
 
     void Stop() {
@@ -100,16 +110,32 @@ private:
         return GetOverlappedResult(pipe, &ov, &written, /*bWait=*/TRUE) != 0;
     }
 
-    void AcceptLoop() {
+    // 現在ユーザーのみ接続可能な DACL を付与する(既定 DACL のままだと
+    // ローカルの任意の認証済みユーザーが set_param 等の変更系メソッドを
+    // 呼べてしまう)。PIPE_REJECT_REMOTE_CLIENTS も併せて指定し、SMB
+    // 経由のリモート接続の可能性を明示的に遮断する。firstInstance が真の
+    // ときだけ FILE_FLAG_FIRST_PIPE_INSTANCE を付与し、他プロセスが既に
+    // 同名のパイプを作成済み(なりすまし/squatting)であれば
+    // ERROR_ACCESS_DENIED で失敗させる。
+    HANDLE CreatePipeInstance(bool firstInstance) {
+        DWORD openMode = PIPE_ACCESS_DUPLEX | FILE_FLAG_OVERLAPPED;
+        if (firstInstance) openMode |= FILE_FLAG_FIRST_PIPE_INSTANCE;
+        return CreateNamedPipeW(
+            pipeName_.c_str(), openMode,
+            PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT | PIPE_REJECT_REMOTE_CLIENTS, 1,
+            65536, 65536, 0, pipeSecurity_.attributes());
+    }
+
+    // firstPipe: Start() が FILE_FLAG_FIRST_PIPE_INSTANCE 付きで同期的に
+    // 作成済みの最初のパイプインスタンス。2回目以降のループ(クライアント
+    // 切断後の再作成)ではこのフラグを付けずに CreatePipeInstance(false) で
+    // 作り直す(nMaxInstances=1 の下で同時に2つ存在することは無いため、
+    // 再作成時にフラグを付ける必要はない)。
+    void AcceptLoop(HANDLE firstPipe) {
+        bool firstIteration = true;
         while (running_.load(std::memory_order_relaxed)) {
-            // 現在ユーザーのみ接続可能な DACL を付与する(既定 DACL のままだと
-            // ローカルの任意の認証済みユーザーが set_param 等の変更系メソッドを
-            // 呼べてしまう)。PIPE_REJECT_REMOTE_CLIENTS も併せて指定し、SMB
-            // 経由のリモート接続の可能性を明示的に遮断する。
-            HANDLE pipe = CreateNamedPipeW(
-                pipeName_.c_str(), PIPE_ACCESS_DUPLEX | FILE_FLAG_OVERLAPPED,
-                PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT | PIPE_REJECT_REMOTE_CLIENTS, 1,
-                65536, 65536, 0, pipeSecurity_.attributes());
+            HANDLE pipe = firstIteration ? firstPipe : CreatePipeInstance(/*firstInstance=*/false);
+            firstIteration = false;
             if (pipe == INVALID_HANDLE_VALUE) break;
 
             HANDLE connectEvent = CreateEventW(nullptr, TRUE, FALSE, nullptr);

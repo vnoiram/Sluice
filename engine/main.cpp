@@ -1052,7 +1052,11 @@ int wmain(int argc, wchar_t** argv) {
         return JsonValue::MakeObject();
     });
 
-    pipeServer.Start();
+    if (!pipeServer.Start()) {
+        wprintf(L"engine: failed to start control pipe \\\\.\\pipe\\sluice-engine "
+                 L"(already in use by another process?)\n");
+        return 1;
+    }
     wprintf(L"running. Press Ctrl+C to stop.\n");
 
     // --- 監視ループ(1 秒ごとに統計・push 通知、デバイスリセット要求を処理) ---
