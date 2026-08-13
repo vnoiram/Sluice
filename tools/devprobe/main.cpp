@@ -17,16 +17,11 @@
 #include "device/vac.h"
 #include "device/vb_cable.h"
 #include "device/wasapi_device.h"
+#include "format_caps.h"
 
 namespace {
 
 constexpr double kSampleRate = 48000.0;
-
-void PrintCaps(const DeviceCaps& caps) {
-    wprintf(L"supports64=%s  lane=%s  min=%u  fundamental=%u  default=%u\n",
-            caps.supports64 ? L"yes" : L"no", caps.recommendedLane == Lane::RT ? L"RT" : L"Compat",
-            caps.minPeriodFrames, caps.fundamentalFrames, caps.defaultPeriodFrames);
-}
 
 }  // namespace
 
@@ -43,14 +38,14 @@ int wmain(int argc, wchar_t** argv) {
     for (const auto& ep : wasapi::EnumerateEndpoints(/*isCapture=*/true)) {
         wasapi::WasapiDevice dev(ep.id, /*isCapture=*/true);
         wprintf(L"[%s]  ", ep.name.c_str());
-        PrintCaps(dev.Probe(kSampleRate));
+        wprintf(L"%ls", FormatCaps(dev.Probe(kSampleRate)).c_str());
     }
 
     wprintf(L"\n=== WASAPI render endpoints ===\n");
     for (const auto& ep : wasapi::EnumerateEndpoints(/*isCapture=*/false)) {
         wasapi::WasapiDevice dev(ep.id, /*isCapture=*/false);
         wprintf(L"[%s]  ", ep.name.c_str());
-        PrintCaps(dev.Probe(kSampleRate));
+        wprintf(L"%ls", FormatCaps(dev.Probe(kSampleRate)).c_str());
     }
 
     // KS フィルタは入出力方向がピンを辿らないと分からない(ks_device.h 冒頭
@@ -61,7 +56,7 @@ int wmain(int argc, wchar_t** argv) {
     for (const auto& info : ks::EnumerateKsAudioDevices()) {
         ks::KsDevice dev(info, /*isCapture=*/true);
         wprintf(L"[%s]  ", info.friendlyName.c_str());
-        PrintCaps(dev.Probe(kSampleRate));
+        wprintf(L"%ls", FormatCaps(dev.Probe(kSampleRate)).c_str());
     }
 
     wprintf(L"\n=== Virtual devices ===\n");
