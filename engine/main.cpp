@@ -254,7 +254,7 @@ void RebuildEngineGraph(MixerState& st) {
         DeviceEntry& entry = st.devices[(size_t)b.deviceIndex];
         std::vector<SpscRing<float>*> outputs{entry.device->RenderRing(b.channel)};
         const Lane lane = entry.device->Status().lane;
-        buses.emplace_back(st.maxBlockFrames, std::move(outputs), b.params,
+        buses.emplace_back(st.maxBlockFrames, (float)kSampleRate, std::move(outputs), b.params,
                            b.outputBoundaryIndex, lane);
     }
 
@@ -563,6 +563,7 @@ JsonValue CompParamsToJson(const CompParams& p) {
     v["attackMs"] = p.attackMs;
     v["releaseMs"] = p.releaseMs;
     v["makeupDb"] = p.makeupDb;
+    v["lookaheadMs"] = p.lookaheadMs;
     return v;
 }
 void CompParamsFromJson(const JsonValue& v, CompParams* p) {
@@ -572,6 +573,7 @@ void CompParamsFromJson(const JsonValue& v, CompParams* p) {
     if (v.Has("attackMs")) p->attackMs = (float)v.At("attackMs").AsNumber(p->attackMs);
     if (v.Has("releaseMs")) p->releaseMs = (float)v.At("releaseMs").AsNumber(p->releaseMs);
     if (v.Has("makeupDb")) p->makeupDb = (float)v.At("makeupDb").AsNumber(p->makeupDb);
+    if (v.Has("lookaheadMs")) p->lookaheadMs = (float)v.At("lookaheadMs").AsNumber(p->lookaheadMs);
 }
 
 JsonValue LimiterParamsToJson(const LimiterParams& p) {

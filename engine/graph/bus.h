@@ -27,18 +27,20 @@ public:
     // outputs: このバスの割当先(物理/仮想出力のチャンネル。複数可)。
     // ポインタの寿命は EngineGraph 側が保証する(デバイスが所有する
     // RenderRing を指すだけで、BusRuntime は所有しない)。
+    // sampleRate: limiter_(lookahead 遅延線のサイズ決定)に使う。
     // outputBoundaryIndex: このバスが非マスター出力デバイスに属する場合、
     // 対応する OutputBoundary のインデックス(engine_graph.h)。既定の -1 は
     // 「マスターバス、ASRC を適用しない」を意味する(実装ガイド §5.1 の
     // 考え方どおり、マスター自身の callback がブロック境界そのものなので
     // 不要かつ有害)。>= 0 のときだけ outputs_ の非 null 要素ごとに
     // AsrcWriter を確保する。
-    BusRuntime(int maxBlockFrames, std::vector<SpscRing<float>*> outputs,
+    BusRuntime(int maxBlockFrames, float sampleRate, std::vector<SpscRing<float>*> outputs,
               const BusParams& initial, int outputBoundaryIndex = -1,
               Lane lane = Lane::Compat)
         : mixBuf_((size_t)maxBlockFrames, 0.0f),
           outputs_(std::move(outputs)),
           params_(initial),
+          limiter_(sampleRate),
           outputBoundaryIndex_(outputBoundaryIndex) {
         if (outputBoundaryIndex_ >= 0) {
             asrcWriters_.reserve(outputs_.size());

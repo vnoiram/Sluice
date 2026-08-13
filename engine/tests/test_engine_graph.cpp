@@ -126,9 +126,9 @@ void TestMixMath() {
     b2.limiter.enabled = false;
 
     std::vector<BusRuntime> buses;
-    buses.emplace_back(kBlockFrames, std::vector<SpscRing<float>*>{out0.get()}, b0);
-    buses.emplace_back(kBlockFrames, std::vector<SpscRing<float>*>{out1.get()}, b1);
-    buses.emplace_back(kBlockFrames, std::vector<SpscRing<float>*>{out2.get()}, b2);
+    buses.emplace_back(kBlockFrames, kSampleRate, std::vector<SpscRing<float>*>{out0.get()}, b0);
+    buses.emplace_back(kBlockFrames, kSampleRate, std::vector<SpscRing<float>*>{out1.get()}, b1);
+    buses.emplace_back(kBlockFrames, kSampleRate, std::vector<SpscRing<float>*>{out2.get()}, b2);
 
     EngineGraph graph(std::move(boundaries), std::move(strips), std::move(buses));
 
@@ -202,7 +202,8 @@ void TestRcuStress() {
         std::vector<StripRuntime> strips;
         strips.emplace_back(*ring, kBlockFrames, kSampleRate, p, /*boundaryIndex=*/0);
         std::vector<BusRuntime> buses;
-        buses.emplace_back(kBlockFrames, std::vector<SpscRing<float>*>{out.get()}, BusParams{});
+        buses.emplace_back(kBlockFrames, kSampleRate, std::vector<SpscRing<float>*>{out.get()},
+                           BusParams{});
         return std::make_unique<EngineGraph>(std::move(boundaries), std::move(strips),
                                              std::move(buses));
     };
