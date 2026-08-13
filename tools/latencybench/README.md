@@ -67,6 +67,17 @@ build\Release\latencybench.exe --sweep "Line 1" "Line 1" ^
    されているか(`--csv` の `effectiveLatencyMs` が値ごとに単調に変化する
    か)を目視確認してほしい。
 
+**実機で確認済みの既知の罠(修正済み)**: `RestartDriverPnp`(PnP 経由の
+無効化→有効化)は、管理者として実行していても `SetupDiCallClassInstaller`
+が `ERROR_INVALID_DATA`(13)で拒否されることを確認した。原因は
+`SE_LOAD_DRIVER_NAME` 特権が管理者トークンにも「保持されているが既定で
+無効」の状態でしか入っておらず、明示的に有効化していなかったこと
+(Device Manager の GUI からの無効化は成功していたので、devmgmt.msc は
+内部でこの特権を有効化してから操作していると推定される)。
+`vac_registry.h::detail::EnableLoadDriverPrivilege` で `AdjustTokenPrivileges`
+により明示的に有効化するよう修正済み。実機で再検証し、直っているか
+教えてほしい。
+
 ## VB-CABLE 内部設定について(未実装、要 reg export 差分)
 
 VB-CABLE の内部レイテンシ/サンプルレートは `VBCABLE_ControlPanel.exe`

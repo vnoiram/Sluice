@@ -250,6 +250,49 @@ inline bool ContainsCaseInsensitive(const std::wstring& haystack, const std::wst
     };
     return toUpper(haystack).find(toUpper(needle)) != std::wstring::npos;
 }
+
+// SE_LOAD_DRIVER_NAME はドライバの有効化/無効化系 API(SetupDiCallClassInstaller の
+// DIF_PROPERTYCHANGE も含む)に必要な特権。管理者のトークンにも「保持されているが
+// 既定で無効」の状態で入っているだけなので、AdjustTokenPrivileges で明示的に
+// 有効化しないと ERROR_INVALID_DATA で拒否される(実機で確認: 管理者として実行
+// しても RestartDriverPnp の DICS_DISABLE が "failed: 13" になる一方、Device
+// Manager の GUI からの同じデバイスの無効化は成功する ── devmgmt.msc は自分の
+// プロセス内でこの特権を有効化してから操作しているため、との推定)。
+inline bool EnableLoadDriverPrivilege(std::wstring* err) {
+    HANDLE token = nullptr;
+    if (!OpenProcessToken(GetCurrentProcess(), TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY, &token)) {
+        if (err) *err = L"OpenProcessToken failed: " + std::to_wstring(GetLastError());
+        return false;
+    }
+
+    LUID luid{};
+    if (!LookupPrivilegeValueW(nullptr, SE_LOAD_DRIVER_NAME, &luid)) {
+        const DWORD lookupErr = GetLastError();
+        CloseHandle(token);
+        if (err)
+            *err = L"LookupPrivilegeValueW(SE_LOAD_DRIVER_NAME) failed: " + std::to_wstring(lookupErr);
+        return false;
+    }
+
+    TOKEN_PRIVILEGES priv{};
+    priv.PrivilegeCount = 1;
+    priv.Privileges[0].Luid = luid;
+    priv.Privileges[0].Attributes = SE_PRIVILEGE_ENABLED;
+
+    const BOOL adjusted = AdjustTokenPrivileges(token, FALSE, &priv, sizeof(priv), nullptr, nullptr);
+    const DWORD adjustErr = GetLastError();
+    CloseHandle(token);
+    // AdjustTokenPrivileges は特権を1つも反映できなくても ERROR_NOT_ALL_ASSIGNED
+    // 付きで TRUE を返すことがあるため、戻り値だけでなく GetLastError も見る。
+    if (!adjusted || adjustErr == ERROR_NOT_ALL_ASSIGNED) {
+        if (err)
+            *err = L"AdjustTokenPrivileges(SE_LOAD_DRIVER_NAME) failed: " + std::to_wstring(adjustErr) +
+                  L" (管理者として実行していても、このプロセストークンに特権が"
+                  L"割り当てられていない可能性があります)";
+        return false;
+    }
+    return true;
+}
 }  // namespace detail
 
 // RestartDriverService の代替(実機で ControlService(SERVICE_CONTROL_STOP) が
@@ -275,6 +318,15 @@ inline bool ContainsCaseInsensitive(const std::wstring& haystack, const std::wst
 //   - ドライバが実際に使用中の場合、無効化がエラーになる、または成功しても
 //     既に開いていた他アプリのストリームが切断される可能性がある。
 inline bool RestartDriverPnp(std::wstring* err) {
+    // 実機で確認済み: これを呼ばずに DIF_PROPERTYCHANGE/DICS_DISABLE を叩くと、
+    // 管理者権限で実行していても ERROR_INVALID_DATA(13)で拒否される
+    // (detail::EnableLoadDriverPrivilege のコメント参照)。
+    std::wstring privErr;
+    if (!detail::EnableLoadDriverPrivilege(&privErr)) {
+        if (err) *err = L"EnableLoadDriverPrivilege: " + privErr;
+        return false;
+    }
+
     HDEVINFO devInfo = SetupDiGetClassDevsW(&GUID_DEVCLASS_MEDIA, nullptr, nullptr, DIGCF_PRESENT);
     if (devInfo == INVALID_HANDLE_VALUE) {
         if (err) *err = L"SetupDiGetClassDevsW(GUID_DEVCLASS_MEDIA) failed: " +
