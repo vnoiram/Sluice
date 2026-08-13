@@ -1,0 +1,9 @@
+renderDevice,captureDevice,accessMethod,requestedBufferFrames,effectiveLatencyMs,xrunCount,cpuPercent,vacMsPerInt
+Line 1,Line 1,wasapi_shared,64,11.896,1218,3.25,
+Line 1,Line 1,wasapi_shared,128,12.500,526,0.00,
+Line 1,Line 1,wasapi_shared,256,20.167,233,0.00,
+Line 1,Line 1,wasapi_shared,512,45.438,105,0.00,
+Line 1,Line 1,wasapi_exclusive,64,0.000,0,10.23,
+Line 1,Line 1,wasapi_exclusive,128,0.000,0,0.00,
+Line 1,Line 1,wasapi_exclusive,256,0.000,0,0.00,
+Line 1,Line 1,wasapi_exclusive,512,0.000,0,0.00,
