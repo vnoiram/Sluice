@@ -9,6 +9,16 @@
 build/
 out/
 
+# .NET ビルド成果物(ui/SluiceUi*)
+bin/
+obj/
+
+# 秘密情報を含みうるローカル設定
+.env
+.env.*
+*.key
+*.pem
+
 # ASIO SDK 等、ライセンス上リポジトリにコミットしてはならない外部 SDK。
 # ビルドには不要になった(asio-abi/ の独自 ABI 実装を使う、
 # asio-abi/README.md 参照)。開発時の事実確認用に任意で置く場合のみ対象。
